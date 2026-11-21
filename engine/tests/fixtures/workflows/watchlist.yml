@@ -1,0 +1,89 @@
+name: watchlist
+
+# 실행 트리거: 외부 스케줄러(Google Cloud Scheduler 등)가 workflow_dispatch를 호출하는 방식을 권장.
+# 하루 2회(ALL) 돌리면 시장별 실행 없이도 KR(장마감 후)·US(마감 후)가 모두 최신이 된다.
+#   예) 16:40 KST (KR 마감 후), 07:30 KST (US 마감 후)  -> 캐시 덕에 두 번째부터는 증분 수집만 한다.
+on:
+  workflow_dispatch:
+    inputs:
+      market:
+        description: "대상 시장"
+        type: choice
+        options: [ALL, KR, US]
+        default: ALL
+      refresh_cache:
+        description: "캐시 무시하고 전체 재수집"
+        type: boolean
+        default: false
+  # schedule:                      # GitHub 자체 cron을 쓰려면 주석 해제 (UTC 기준, 지연될 수 있음)
+  #   - cron: "40 7 * * 1-5"       # 16:40 KST
+  #   - cron: "30 22 * * 0-4"      # 07:30 KST (월~금)
+
+permissions:
+  contents: write
+  actions: read  # 기존 신호의 성공한 게시 Workflow 완료 시각 확인(시세/API 추가 수집 없음)
+
+# 같은 데이터 폴더를 쓰는 실행이 겹치지 않게 직렬화 (저널 수집기와는 별도 그룹)
+concurrency:
+  group: watchlist-data
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: watchlist
+    env:
+      TZ: Asia/Seoul
+      KRX_ID: ${{ secrets.KRX_ID }}          # pykrx가 KRX 로그인을 요구함
+      KRX_PW: ${{ secrets.KRX_PW }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: watchlist/requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Unit self-test (실패하면 데이터 게시 안 함)
+        run: python trend_watchlist.py --self-test
+
+      # 가격·유니버스 캐시(watchlist/data)를 실행 간에 유지: 매번 새 키로 저장, 이전 키로 복원
+      - name: Restore caches
+        uses: actions/cache@v4
+        with:
+          path: watchlist/data
+          key: wl-cache-${{ github.run_id }}
+          restore-keys: |
+            wl-cache-
+
+      - name: Run engine
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WATCHLIST_VERIFY_PUBLICATIONS: 'true'
+        run: |
+          ARGS="--market ${{ inputs.market || 'ALL' }}"
+          if [ "${{ inputs.refresh_cache }}" = "true" ]; then ARGS="$ARGS --refresh-cache"; fi
+          python trend_watchlist.py $ARGS
+
+      - name: Commit published data and reports
+        run: |
+          git config user.name "watchlist-bot"
+          git config user.email "watchlist-bot@users.noreply.github.com"
+          git add -A published reports
+          if git diff --cached --quiet; then
+            echo "변경 없음"; exit 0
+          fi
+          git commit -m "watchlist: $(date +'%Y-%m-%d %H:%M') KST"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin "${{ github.ref_name }}" && git push origin "HEAD:${{ github.ref_name }}" && exit 0
+            echo "push 재시도 $i"; sleep $((i * 5))
+          done
+          echo "push 실패"; exit 1
+

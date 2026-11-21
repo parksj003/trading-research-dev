@@ -1,0 +1,39 @@
+{
+  "schema": "base-observations-1",
+  "run_id": "run-1",
+  "generated_at": "2026-11-09T23:00:00Z",
+  "status": "enabled",
+  "generation": "a0a108546e996e38e2ea4d18bc36a736d048522a32068d8eaf44fbf704746901",
+  "observations": [
+    {
+      "market": "US",
+      "ticker": "SYNTH",
+      "as_of": "2024-04-30",
+      "status": "BREAKOUT_CONFIRMED",
+      "quality": "CONFIRMED",
+      "reason": "FOLLOW_THROUGH",
+      "completed_base_count": 1,
+      "current_base_ordinal": 1,
+      "cycle_id": "d3c745d4a229482b69b26a58e21f795fe7219f3f20c5efb66d734a3fa0903cfe",
+      "base_id": "4ffb9c07ecb9b64a1b7b6aa528bddc60955c2ae323302c8454253ff4b3a53e3f",
+      "base_on_base": false,
+      "base_start_date": "2024-04-11",
+      "base_first_observed_date": "2024-04-12",
+      "base_confirmed_date": "2024-04-23",
+      "base_breakout_date": "2024-04-26",
+      "base_breakout_confirmed_date": "2024-04-30",
+      "base_end_date": "2024-04-30",
+      "base_length_days": 14,
+      "base_depth_pct": 17.829341317365277,
+      "base_structural_pivot": 200.4,
+      "geometry_revision": 0,
+      "algorithm_version": "base-observation-0.1",
+      "config_hash": "3111564bfa9338b850aba650b2021906f2c852e385b48fa106a6671bcb9851a3",
+      "price_basis": "synthetic-adjusted",
+      "data_revision": "v1",
+      "recorded_at": "2026-11-09T23:00:00+00:00",
+      "mode": "LIVE"
+    }
+  ]
+}
+

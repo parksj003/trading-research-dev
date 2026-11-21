@@ -1,0 +1,4 @@
+-r engine/requirements.txt
+-r app/requirements.txt
+pytest>=8,<10
+pytest-socket>=0.7,<1

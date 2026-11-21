@@ -1,0 +1,3 @@
+enabled,watch_region,watch_sector,watch_subsector,symbol,name,asset_type,unit,chart_style,sort_order,note
+true,US,Synthetic,,NASDAQ:NBI,Synthetic index fixture,index,지수 포인트,line,1,Synthetic fixture only
+true,US,Synthetic,,NASDAQ:DEMO,Synthetic stock fixture,stock,USD,candles,2,Synthetic fixture only

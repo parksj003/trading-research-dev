@@ -1,0 +1,25 @@
+# Trend Leader Watchlist v10 - requirements
+# Python 3.10+ 권장 (GitHub Actions: 3.11)
+
+# --- 핵심 ---
+numpy>=1.26,<3
+pandas>=2.1,<3        # pickle 캐시 호환성을 위해 메이저 버전 고정
+pyyaml>=6.0
+
+# --- 데이터 소스 ---
+pykrx>=1.0.45         # KR 시세/시총/펀더멘털/ETF PDF
+yfinance>=0.2.54      # US 시세 (fast_info, 레이트리밋 대응 버전 이상)
+requests>=2.31        # 위키피디아 유니버스 수집
+
+# --- pd.read_html (S&P500 / Nasdaq-100 표 파싱) ---
+lxml>=4.9
+
+# --- collector_github_actions.py (from github import Auth, Github) ---
+PyGithub>=2.1
+
+# --- 선택 ---
+python-dotenv>=1.0    # .env 로드 (없어도 동작)
+
+# Exchange session closes, holidays and early closes (offline calendar).
+exchange-calendars>=4.13,<5
+

@@ -1,0 +1,159 @@
+name: Trading Journal Collector
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '실행 모드'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - portfolio     # 원장 변경 없이 포트폴리오 갱신(apply 없으면 조회만)
+          - auto          # 자동: 시황(평일 06~10시 KST) + KR/US 체결 동기화
+          - morning_prep  # 시황 일지만 작성 (date 로 과거 일자 재구성)
+          - hourly_check  # 체결 동기화만 (market, date)
+          - check         # 진단(변경 없음): target = accounts | orders | candles | market
+          - manual        # API가 못 주는 체결 직접 입력: input 에 체결, apply 로 반영
+          - backfill      # 기간(date~date_end) 누락 체결을 원장에 채움: apply 로 저장
+          - rebuild       # 원장 정리: target = journals(기본) | layout, apply 로 반영
+          - report        # 청산 사이클 성과 리포트(승률·손익비·R·조건별 분해): date~date_end(기본 이번 달), apply 로 저장·알림
+          - init          # 템플릿/설정 파일 생성 (overwrite 로 덮어쓰기)
+      market:
+        description: '(선택) 시장 지정: KR 또는 US (비우면 둘 다)'
+        required: false
+        type: string
+      date:
+        description: '(선택) 조회일/시작일: YYYYMMDD (report: 기간 시작)'
+        required: false
+        type: string
+      date_end:
+        description: '(선택) 종료일: YYYYMMDD (backfill 은 비우면 오늘까지)'
+        required: false
+        type: string
+      target:
+        description: 'check: accounts | orders | candles | market   /   rebuild: journals | layout'
+        required: false
+        type: string
+      input:
+        description: 'manual: 계좌,날짜,시장,코드,구분,수량,단가[,수수료[,세금[,종목명]]] (여러 건은 ; 구분)   /   check candles: 종목코드(예: CRWD, 005930)'
+        required: false
+        type: string
+      apply:
+        description: '실제 반영 (manual / backfill / rebuild / report). 끄면 검증·조회만 하는 dry-run'
+        required: false
+        default: false
+        type: boolean
+      overwrite:
+        description: 'backfill: 조회된 구간을 API 값으로 교체   /   init: 템플릿 덮어쓰기'
+        required: false
+        default: false
+        type: boolean
+      delete:
+        description: 'manual: 같은 입력을 원장에서 삭제'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: trading-journal
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Seoul
+
+jobs:
+  collect-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            collector_github_actions.py
+            portfolio_engine.py
+            watchlist/trend_watchlist.py
+            watchlist/analysis_report.py
+            watchlist/session_calendar.py
+            settings.yml
+            requirements.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Python 환경 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 캐시 복원 (일봉 데이터)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data
+          key: journal-cache-${{ github.run_id }}
+          restore-keys: |
+            journal-cache-
+            nh-token-
+
+      - name: 필수 라이브러리 설치
+        run: pip install -r requirements.txt
+
+      - name: 자동 매매일지 스크립트 실행
+        env:
+          PORTFOLIO_EQUITY_AS_OF: ${{ vars.PORTFOLIO_EQUITY_AS_OF }}
+          # Keep trade sync and legacy risk alerts; disable automatic snapshots.
+          # Explicit portfolio mode remains available for manual refreshes.
+          PORTFOLIO_SNAPSHOT_ENABLED: 'false'
+          PYTHONUNBUFFERED: '1'
+          NH_APP_KEY: ${{ secrets.NH_APP_KEY }}
+          NH_APP_SECRET: ${{ secrets.NH_APP_SECRET }}
+          NH_ACCOUNT_CMA: ${{ secrets.NH_ACCOUNT_CMA }}
+          NH_ACCOUNT_ISA: ${{ secrets.NH_ACCOUNT_ISA }}
+          NH_NO_US_ACCOUNTS: ${{ vars.NH_NO_US_ACCOUNTS }}
+          NH_OPTIONAL_ACCOUNTS: ${{ vars.NH_OPTIONAL_ACCOUNTS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATA_REPO_NAME: ${{ github.repository }}
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODE: ${{ inputs.mode }}
+          IN_MARKET: ${{ inputs.market }}
+          IN_DATE: ${{ inputs.date }}
+          IN_DATE_END: ${{ inputs.date_end }}
+          IN_TARGET: ${{ inputs.target }}
+          IN_INPUT: ${{ inputs.input }}
+          IN_APPLY: ${{ inputs.apply }}
+          IN_OVERWRITE: ${{ inputs.overwrite }}
+          IN_DELETE: ${{ inputs.delete }}
+        run: |
+          if [ ! -f "collector_github_actions.py" ]; then
+            echo "::error::collector_github_actions.py 를 찾을 수 없습니다."
+            exit 1
+          fi
+
+          ARGS=(--mode "${MODE:-auto}")
+          [ -n "$IN_MARKET" ]   && ARGS+=(--market "$IN_MARKET")
+          [ -n "$IN_DATE" ]     && ARGS+=(--date "$IN_DATE")
+          [ -n "$IN_DATE_END" ] && ARGS+=(--date-end "$IN_DATE_END")
+          [ -n "$IN_TARGET" ]   && ARGS+=(--target "$IN_TARGET")
+          [ -n "$IN_INPUT" ]    && ARGS+=(--input "$IN_INPUT")
+          [ "$IN_APPLY" = "true" ]     && ARGS+=(--apply)
+          [ "$IN_OVERWRITE" = "true" ] && ARGS+=(--overwrite)
+          [ "$IN_DELETE" = "true" ]    && ARGS+=(--delete)
+
+          echo "🚀 실행 모드: ${MODE:-auto}${IN_TARGET:+ (target=$IN_TARGET)}"
+          python collector_github_actions.py "${ARGS[@]}"
+
+      - name: 캐시 저장 (일봉 데이터)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data
+          key: journal-cache-${{ github.run_id }}
+

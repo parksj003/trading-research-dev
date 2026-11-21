@@ -1,0 +1,8 @@
+# The immutable exit-research-v2 registry was created with these packages.
+# This constraint applies ONLY to .github/workflows/exit_experiments.yml.
+# Never silently rewrite a prior registry or blend research vintages when
+# a newer resolver upgrades one of these calculation-dependent libraries.
+pandas==2.3.3
+numpy==2.5.4
+exchange-calendars==4.13.2
+
