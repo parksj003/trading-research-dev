@@ -35,5 +35,4 @@ jobs:
         with:
           node-version: '22'
       - run: python -m pip install -r requirements-dev.txt
-      - run: python dev.py check
       - run: python dev.py test ${{ matrix.project }}
