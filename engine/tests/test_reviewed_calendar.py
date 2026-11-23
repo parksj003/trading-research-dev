@@ -26,6 +26,7 @@ LEGACY_POLICY = 'reviewed-finality-through-2026-v1'
 
 def bars(dates):
     f = prices(dates)
+    f['_base_price_basis'] = 'pykrx:date:adjusted=True'
     f['High'] = f[['Open', 'Close']].max(axis=1) + 2
     f['Low'] = f[['Open', 'Close']].min(axis=1) - 2
     f['Volume'] = 1000000.

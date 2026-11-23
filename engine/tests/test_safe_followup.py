@@ -76,3 +76,16 @@ def test_existing_filter_failure_and_retained_selection_keep_their_meaning():
     assert result.iloc[0]['drop_reason']=='RS미달'
     assert previous==before
 
+
+
+def test_regressed_market_cutoff_cannot_replace_latest_or_create_daily_snapshot(tmp_path):
+    cfg = deepcopy(engine.DEFAULT_CONFIG)
+    rows = {'KOSPI':pd.DataFrame()}
+    def publish(day, price_day):
+        regs = {'KOSPI':dict(regime='RISK_OFF', signal_light='RISK_OFF', as_of=price_day)}
+        return engine.publish_artifacts(day, rows, rows, regs, {}, pd.DataFrame(), pd.DataFrame(), cfg, base_dir=tmp_path)
+    assert publish('2026-11-05','2026-11-05')
+    prior = (tmp_path/'latest/manifest.json').read_bytes()
+    assert publish('2026-11-06','2026-11-04') is None
+    assert (tmp_path/'latest/manifest.json').read_bytes() == prior
+    assert not (tmp_path/'daily/2026-11-06').exists()

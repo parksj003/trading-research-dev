@@ -3225,6 +3225,7 @@ def clean_validation_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     def numeric(key):
         return pd.to_numeric(out.get(key, pd.Series(index=out.index, dtype=float)), errors="coerce").replace([np.inf,-np.inf],np.nan)
     complete = numeric("ret_10d").notna() & (numeric("bars") >= 10)
+    complete &= out.get("review_reason", pd.Series(index=out.index, dtype=str)).fillna("").eq("")
     complete &= tf(out.get("calendar_complete_10d",pd.Series(index=out.index,dtype=str)))
     out["ret_10d"] = numeric("ret_10d").where(complete)
     version = out.get("calculation_version", pd.Series(index=out.index,dtype=str)).eq("fixed_horizon_dates_v2")
@@ -3510,6 +3511,11 @@ def tab_validation(b: Bundle) -> None:
         render_exit_experiments(b.exit_experiments,b.exit_experiment_source,"dark" if is_dark_mode() else "light")
         return
     o = clean_validation_metrics(o)
+    if "review_reason" in o:
+        held = o[o.review_reason.fillna("").ne("")]
+        if not held.empty:
+            with st.expander(f"기존 성과 보존 · 재검증 대기 {len(held)}건"):
+                st.dataframe(held.filter(items=["first_seen", "market", "ticker", "review_reason"]), hide_index=True)
     if "market" not in o:
         st.warning("market 컬럼이 없어 시장을 구분할 수 없습니다.")
         o["market"] = "미분류"

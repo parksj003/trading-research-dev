@@ -174,6 +174,7 @@
     "engine/watchlist/manual_eod_source_diagnostics.py": "a6408e34a19ea1ce8e160a1fd468251518fc4cd09fa258e036b8efe80cad45c4",
     "engine/watchlist/manual_eod_yfinance.py": "6b7815326af1610e24093dae786c92764582341882e6c43e2539df8fda0214ca",
     "engine/watchlist/manual_macro_review.py": "bffd98c0ef87baf5a8c94964648dc87313e0cae3301a55522436353549179454",
+    "engine/watchlist/outcome_review.py": "cc1462f4d7fb8221b06d0b33468cbedfdd1c3cb26774ba1b2a097966ae9fee1b",
     "engine/watchlist/requirements.txt": "87a067309af0bef46573ca7253d2e65ba8cdafcb09629c85ccfc7c7eb3e20154",
     "engine/watchlist/sector_review.py": "c494e0df72aedd234972a6e07e49b22d83b76b0f87b339e0ba377fd61ab34515",
     "engine/watchlist/session_calendar.py": "d79987e5f5b9462eb2d9c8e18e967ca2ad0340338c3093368ab9587d58da0423",

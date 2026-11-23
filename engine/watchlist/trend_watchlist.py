@@ -704,14 +704,29 @@ def has_seam_mismatch(cached_df: pd.DataFrame, new_df: pd.DataFrame, tol: float 
         return False
     ov = cached_df.index.intersection(new_df.index)
     if len(ov) == 0:
-        return False
+        return True
     c_old = pd.to_numeric(cached_df.loc[ov, "Close"], errors="coerce")
     c_new = pd.to_numeric(new_df.loc[ov, "Close"], errors="coerce")
     valid = (c_old > 0) & (c_new > 0)
     if not valid.any():
-        return False
+        return True
     max_diff = float(((c_old[valid] / c_new[valid]) - 1.0).abs().max())
     return max_diff > tol
+
+def _save_price_cache(path, frame):
+    tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    try:
+        frame.to_pickle(tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _replacement_covers(cached, replacement, start, market):
+    expected = cached.index[(cached.index >= start) & cached.index.isin(get_calendar(market).sessions)]
+    confirmed = _completed_cached_bars(Path(), replacement, market)
+    return expected.isin(confirmed.index).all()
+
 
 def is_cache_fresh(path: Path, ttl_hours: float, refresh: bool = False) -> bool:
     return (not refresh) and path.exists() and ((time.time() - path.stat().st_mtime) < ttl_hours * 3600)
@@ -1218,6 +1233,7 @@ def bulk_sync_kr_recent_ohlcv(universe_tickers: list[str], cfg: dict) -> dict[st
 
     rename_cols = {"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume", "거래대금": "Turnover"}
     synced_cnt = 0
+    calendar = get_calendar("KR")
     for tkr in stale_tkrs:
         cpath = KR_HISTORY_CACHE_DIR / f"{tkr}.pkl"
         try:
@@ -1234,13 +1250,17 @@ def bulk_sync_kr_recent_ohlcv(universe_tickers: list[str], cfg: dict) -> dict[st
             if not new_rows:
                 continue
             new_df = tag_completed_sessions(normalize_index(tag_raw_price_quality(pd.concat(new_rows))), "KR")
-            if has_seam_mismatch(cdf, new_df):
+            confirmed = kr_completed_cached_bars(cpath, new_df)
+            if cdf.index[-1] not in confirmed.index:
+                continue
+            expected = calendar.sessions_in_range(cdf.index[-1], confirmed.index[-1])
+            if not expected.isin(confirmed.index).all() or has_seam_mismatch(cdf, new_df):
                 continue
             if (close_target is not None and new_df.index[-1] < close_target
                     and new_df.index[-1] <= cdf.index[-1]):
                 continue
-            merged = normalize_index(pd.concat([cdf, new_df]))
-            merged.to_pickle(cpath)
+            merged = normalize_index(pd.concat([cdf, new_df.loc[new_df.index > cdf.index[-1]]]))
+            _save_price_cache(cpath, merged)
             synced_cnt += 1
         except Exception as _exc:
             _swallow("bulk_sync_kr_recent_ohlcv", _exc, locals().get("tkr") or locals().get("ticker"))
@@ -1489,7 +1509,7 @@ def fetch_kr_history(ticker: str, years: int, is_index: bool = False, cfg: dict 
     repair_start = None
     rename = {"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume", "거래대금": "Turnover"}
 
-    if not refresh and cpath.exists():
+    if cpath.exists():
         try:
             raw_cached = normalize_index(pd.read_pickle(cpath))
             cdf = kr_completed_cached_bars(cpath, raw_cached)
@@ -1502,7 +1522,7 @@ def fetch_kr_history(ticker: str, years: int, is_index: bool = False, cfg: dict 
             _swallow("fetch_kr_history", _exc, locals().get("tkr") or locals().get("ticker"))
             cdf = pd.DataFrame()
 
-    if not cdf.empty and "Close" in cdf.columns:
+    if not refresh and not cdf.empty and "Close" in cdf.columns:
         covers = cdf.index[0] <= (req_start_naive + pd.Timedelta(days=15))
         if covers and repair_start is None and not kr_history_needs_refresh(cpath, ttl, refresh, cdf):
             return cdf.loc[cdf.index >= req_start_naive].copy()
@@ -1527,10 +1547,9 @@ def fetch_kr_history(ticker: str, years: int, is_index: bool = False, cfg: dict 
                             # 전일 겹침만 반환되면 mtime을 최신으로 만들지 않는다.
                             return cdf.loc[cdf.index >= req_start_naive].copy()
                         merged = normalize_index(pd.concat([cdf, norm_new]))
-                        merged.to_pickle(cpath)
+                        _save_price_cache(cpath, merged)
                         return kr_completed_cached_bars(cpath, merged).loc[lambda x: x.index >= req_start_naive].copy()
                     LOG.info("[%s] 수정주가 변경(이음새 괴리) 감지 -> 전체 기간 재다운로드", t_key)
-                    cdf = pd.DataFrame()
                 else:
                     # 증분 응답이 없다는 이유로 동일 공급자에 전체 기간을 다시 요청하지 않는다.
                     return cdf.loc[cdf.index >= req_start_naive].copy()
@@ -1549,11 +1568,14 @@ def fetch_kr_history(ticker: str, years: int, is_index: bool = False, cfg: dict 
 
     res = tag_completed_sessions(normalize_index(tag_raw_price_quality(df.rename(columns=rename))), "KR")
     _tag_kr_base_price_basis(res, fn, is_index)
-    if not cdf.empty and not has_seam_mismatch(cdf, res):
-        res = normalize_index(pd.concat([cdf, res]))
+    if not cdf.empty:
+        if not has_seam_mismatch(cdf, res):
+            res = normalize_index(pd.concat([cdf, res]))
+        elif not _replacement_covers(cdf, res, req_start_naive, "KR"):
+            return cdf.loc[cdf.index >= req_start_naive].copy()
     if not res.empty:
         try:
-            res.to_pickle(cpath)
+            _save_price_cache(cpath, res)
         except Exception as _exc:
             _swallow("fetch_kr_history", _exc, locals().get("tkr") or locals().get("ticker"))
             pass
@@ -1575,7 +1597,7 @@ def fetch_us_histories(tickers: list[str], years: int, cfg: dict | None = None) 
 
     for tkr in tickers:
         cp = US_HISTORY_CACHE_DIR / f"{tkr}.pkl"
-        if not refresh and cp.exists():
+        if cp.exists():
             try:
                 cdf = us_completed_cached_bars(cp, normalize_index(pd.read_pickle(cp)))
                 if not cdf.empty and "Close" in cdf.columns:
@@ -1585,7 +1607,7 @@ def fetch_us_histories(tickers: list[str], years: int, cfg: dict | None = None) 
                             and (close_target is None or cdf.index[-1] >= close_target)):
                         result[tkr] = cdf.loc[cdf.index >= req_start_ts].copy()
                         continue
-                    if covers:
+                    if covers and not refresh:
                         inc_tkrs.append(tkr)
                         ldt = cdf.index[-1] - pd.Timedelta(days=7)
                         earliest_inc = ldt if earliest_inc is None or ldt < earliest_inc else earliest_inc
@@ -1644,11 +1666,12 @@ def fetch_us_histories(tickers: list[str], years: int, cfg: dict | None = None) 
                             _resc = rescale_cached_for_dividend(cached_map[tkr], cleaned)
                             if _resc is None:
                                 seam_refetch_tkrs.append(tkr)
-                                cached_map.pop(tkr, None)
                                 continue
                             cached_map[tkr] = _resc
                         cleaned = normalize_index(pd.concat([cached_map[tkr], cleaned]))
-                    cleaned.to_pickle(US_HISTORY_CACHE_DIR / f"{tkr}.pkl")
+                    elif tkr in cached_map and not _replacement_covers(cached_map[tkr], cleaned, req_start_ts, "US"):
+                        continue
+                    _save_price_cache(US_HISTORY_CACHE_DIR / f"{tkr}.pkl", cleaned)
                     result[tkr] = us_completed_cached_bars(US_HISTORY_CACHE_DIR / f"{tkr}.pkl", cleaned).loc[lambda x: x.index >= req_start_ts].copy()
                 except Exception as _exc:
                     _swallow("_dl_chunks", _exc, locals().get("tkr") or locals().get("ticker"))
@@ -3158,6 +3181,37 @@ def sync_track_sizing_with_final_regime(rows: list[dict[str, Any]], final_regime
         r["position_size_pct"] = pos_sz
         r["trade_risk_pct"] = round(pos_sz * eff_stop_abs, 2)
 
+def observation_tickers(cfg, market):
+    """Price-only subscribers. Anchor the 120-session window at the last publication
+    so a pause spanning the end of a signal's observation still gets one refresh.
+    """
+    base = ROOT / cfg.get("publish", {}).get("dir", "published")
+    signals = base / "history/signals.csv"
+    if not signals.exists():
+        return set()
+    ledger = pd.read_csv(signals, dtype=str)
+    cal = get_calendar(market)
+    today = pd.Timestamp(datetime.now(KST if market == "KR" else ZoneInfo("America/New_York")).date())
+    reference = cal.date_to_session(today, direction="previous")
+    pointer = base / "latest/manifest.json"
+    if pointer.exists():
+        dates = json.loads(pointer.read_text()).get("as_of", {})
+        tracks = _KR_SUBS if market == "KR" else _US_SUBS
+        for track in tracks:
+            if dates.get(track):
+                reference = min(reference, pd.Timestamp(dates[track]))
+    start = cal.sessions[max(0, cal.sessions.searchsorted(reference) - 120)]
+    rows = ledger.loc[ledger.market.eq(market)]
+    # Exit research can enter after a late publication. Include first_seen as well.
+    active = pd.to_datetime(rows.first_seen, errors="coerce").between(start, today)
+    if "as_of" in rows:
+        active |= pd.to_datetime(rows.as_of, errors="coerce").between(start, today)
+    symbols = rows.loc[active, "ticker"].dropna().str.upper()
+    pattern = r"[0-9]{1,6}" if market == "KR" else r"[A-Z0-9][A-Z0-9.\-]{0,19}"
+    symbols = symbols[symbols.str.fullmatch(pattern)]
+    return set(symbols.str.zfill(6) if market == "KR" else symbols)
+
+
 def run_kr_tracks(
     cfg: dict,
     overrides: dict[str, tuple[str, str]],
@@ -3178,10 +3232,13 @@ def run_kr_tracks(
 
     universe = _protect_sector_assignments(get_kr_universe(cfg, overrides), cfg, overrides)
     sector_review_input = _sector_review_input(universe, cfg)
-    kr_sync = bulk_sync_kr_recent_ohlcv(universe["ticker"].astype(str).str.zfill(6).tolist(), cfg)
+    screen_tickers = set(universe["ticker"].astype(str).str.zfill(6))
+    subscribed = observation_tickers(cfg, "KR")
+    # The cross-sectional feed does not attest adjusted prices for absolute stops.
+    kr_sync = bulk_sync_kr_recent_ohlcv(sorted(screen_tickers - subscribed), cfg)
+    _kr_all = sorted(screen_tickers | subscribed)
 
     kr_workers = int(cfg["runtime"].get("kr_fetch_workers", 4))
-    _kr_all = universe["ticker"].astype(str).str.zfill(6).tolist()
     _kr_need = [t for t in _kr_all if kr_history_needs_refresh(KR_HISTORY_CACHE_DIR / f"{t}.pkl", ttl, refresh)]
     prefetched_kr = prefetch_histories(
         _kr_need, lambda t: fetch_kr_history(t, years, is_index=False, cfg=cfg, sync_state=kr_sync), kr_workers, min(pause, 0.06),
@@ -3363,7 +3420,11 @@ def run_us_tracks(
 
     spy_tkr = str(cfg["market_regime"].get("sp500_benchmark", "SPY"))
     qqq_tkr = str(cfg["market_regime"].get("nasdaq_benchmark", "QQQ"))
-    histories = fetch_us_histories(list(set(universe["ticker"].tolist() + [spy_tkr, qqq_tkr])), years, cfg=cfg)
+    screen_tickers = set(universe["ticker"]) | {spy_tkr, qqq_tkr}
+    histories = fetch_us_histories(sorted(screen_tickers), years, cfg=cfg)
+    extra = observation_tickers(cfg, "US") - screen_tickers
+    if extra:
+        fetch_us_histories(sorted(extra), years, cfg=cfg)
     spy_hist = trim_incomplete_bar(histories.get(spy_tkr, pd.DataFrame()), "US", trim_bar)
     qqq_hist = trim_incomplete_bar(histories.get(qqq_tkr, pd.DataFrame()), "US", trim_bar)
 
@@ -3762,15 +3823,19 @@ def allocate_portfolio_risk_budget(action_df: pd.DataFrame, regimes: dict[str, d
             meta["by_market"][m]["risk"] -= initial_market[m][1]
     return out, meta
 
-def _make_bench_getter(cfg: dict) -> Callable[[str, str], pd.DataFrame]:
-    """sub_market/market 에 맞는 벤치마크 캐시(DataFrame)를 돌려주는 함수를 만든다."""
+def benchmark_cache_files(cfg, dirs):
     mr = cfg.get("market_regime", {})
-    files = {
-        "KOSPI": KR_HISTORY_CACHE_DIR / f"idx_{mr.get('kospi_benchmark', '1001')}.pkl",
-        "KOSDAQ": KR_HISTORY_CACHE_DIR / f"idx_{mr.get('kosdaq_benchmark', '2001')}.pkl",
-        "NASDAQ100": US_HISTORY_CACHE_DIR / f"{mr.get('nasdaq_benchmark', 'QQQ')}.pkl",
-        "SP500": US_HISTORY_CACHE_DIR / f"{mr.get('sp500_benchmark', 'SPY')}.pkl",
+    return {
+        "KOSPI": dirs["KR"] / f"idx_{mr.get('kospi_benchmark', '1001')}.pkl",
+        "KOSDAQ": dirs["KR"] / f"idx_{mr.get('kosdaq_benchmark', '2001')}.pkl",
+        "NASDAQ100": dirs["US"] / f"{mr.get('nasdaq_benchmark', 'QQQ')}.pkl",
+        "SP500": dirs["US"] / f"{mr.get('sp500_benchmark', 'SPY')}.pkl",
     }
+
+
+def _make_bench_getter(cfg: dict, price_dirs=None) -> Callable[[str, str], pd.DataFrame]:
+    dirs = price_dirs or {"KR": KR_HISTORY_CACHE_DIR, "US": US_HISTORY_CACHE_DIR}
+    files = benchmark_cache_files(cfg, dirs)
     cache: dict[str, pd.DataFrame] = {}
 
     def _get(sub_mkt: str, mkt: str) -> pd.DataFrame:
@@ -4869,6 +4934,8 @@ def update_signal_ledger(base: Path, action_df: pd.DataFrame, d_str: str, cooldo
 CAND_HIST_COLS = ["date", "as_of", "market", "sub_market", "ticker", "name", "sector", "macro_theme", "tier", "setup_stage",
                   "is_actionable", "selected", "rs_score", "rs_change_4w", "topdown_score", "sector_power", "last_close",
                   "stop_price", "dist_to_pivot_pct", "volume_ratio", "vol_ratio_50d", "streak_days", "peg", "eps_growth_pct", "eps_status"]
+OBSERVATION_BASIS = {"KR": "pykrx:date:adjusted=True", "US": "yfinance:auto_adjust=True"}
+FIXED_PATH_POLICY = "contiguous-raw-path-v1"
 OUTCOME_COLS = ["first_seen", "as_of", "market", "sub_market", "track", "ticker", "name", "sector", "setup_stage", "tier",
                 "entry_date", "entry_price", "stop_price", "risk_pct", "bars", "status", "cur_ret",
                 "ret_5d", "ret_10d", "ret_20d", "ex_5d", "ex_10d", "ex_20d",
@@ -4877,7 +4944,9 @@ OUTCOME_COLS = ["first_seen", "as_of", "market", "sub_market", "track", "ticker"
                 "stop_aware_ret_10d", "stop_aware_r_10d", "stop_exit_reason", "stop_exit_date",
                 "calculation_version", "entry_price_source", "stop_price_basis", "evaluated_as_of",
                 "eval_date_5d", "eval_date_10d", "eval_date_20d", "path_ohlc_complete_10d",
-                "calendar_complete_5d", "calendar_complete_10d", "calendar_complete_20d", "entry_session_verified", "calendar_policy"]
+                "calendar_complete_5d", "calendar_complete_10d", "calendar_complete_20d", "entry_session_verified", "calendar_policy",
+                "review_reason", "review_required", "price_prefix_sha256", "path_policy", "round_trip_cost_pct",
+                "signal_run_id", "signal_config_hash"]
 
 def update_candidate_history(base: Path, cand: pd.DataFrame, d_str: str, keep_days: int = 400) -> int:
     """매일의 '상위 선정 ∪ 매수검토' 종목을 컴팩트하게 누적(date,market,ticker 키). 체류일·RS 추이·신규/이탈 분석용."""
@@ -4903,7 +4972,38 @@ def update_candidate_history(base: Path, cand: pd.DataFrame, d_str: str, keep_da
             _swallow("update_candidate_history", _exc)
     return len(c)
 
-def update_signal_outcomes(base: Path, cfg: dict) -> int:
+def _fixed_prefix_hash(frame):
+    columns = ["Open", "High", "Low", "Close", "_raw_open_valid", "_raw_ohlc_valid",
+               "_session_confirmed", "IsHalt", "_base_price_basis", "Stock Splits"]
+    return hashlib.sha256(frame.reindex(columns=columns).to_csv(float_format="%.12g").encode()).hexdigest()
+
+
+def fixed_conflicts(old, new):
+    """Compare previously established facts, excluding naturally evolving live marks."""
+    fields = ["as_of", "round_trip_cost_pct", "signal_run_id", "signal_config_hash", "entry_date", "entry_price", "stop_price", "stop_exit_date", "stop_aware_ret_10d",
+              "stop_aware_r_10d"]
+    for n in (5, 10, 20):
+        fields.extend((f"eval_date_{n}d", f"ret_{n}d", f"ex_{n}d"))
+    if pd.to_numeric(old.get("bars"), errors="coerce") >= 10:
+        fields.extend(("mfe_10d_pct", "mae_10d_pct", "stop_hit_10d"))
+    if old.get("stop_price_basis") == "matched":
+        fields.append("stop_price_basis")
+    if old.get("evaluated_as_of") == new.get("evaluated_as_of") and pd.notna(new.get("price_prefix_sha256")):
+        fields.append("price_prefix_sha256")
+    changed = []
+    for key in fields:
+        left, right = old.get(key), new.get(key)
+        if pd.isna(left) or str(left) == "":
+            continue
+        if str(left) == str(right):
+            continue
+        a, b = pd.to_numeric(left, errors="coerce"), pd.to_numeric(right, errors="coerce")
+        if pd.isna(a) or pd.isna(b) or not np.isclose(a, b, rtol=1e-10, atol=1e-10):
+            changed.append(key)
+    return changed
+
+
+def update_signal_outcomes(base: Path, cfg: dict, *, cutoffs=None, evaluated_at=None, price_dirs=None) -> int:
     """신호별 시간기준 수익과 손절 체결 가정 수익을 분리해 계산하고, 누락 캐시는 기존 이력을 보존한다."""
     sp = base / "history" / "signals.csv"
     if not sp.exists():
@@ -4924,18 +5024,25 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
         _swallow("update_signal_outcomes_old", ValueError("history identity columns missing"), out_path.name)
         return 0
 
-    bench = _make_bench_getter(cfg)
+    bench = _make_bench_getter(cfg, price_dirs) if price_dirs else _make_bench_getter(cfg)
+    dirs = price_dirs or {"KR": KR_HISTORY_CACHE_DIR, "US": US_HISTORY_CACHE_DIR}
     cost = float(cfg.get("screen", {}).get("round_trip_cost_pct", 0.003)) * 100.0
     price_cache: dict[str, pd.DataFrame] = {}
     rows: list[dict[str, Any]] = []
 
-    # O(1) 해시 테이블로 기존 신호 결과 인덱싱 (O(N^2) 반복 검색 제거)
-    old_lookup: dict[tuple[str, str, str], dict[str, Any]] = {}
-    if not old_out.empty and {"first_seen", "market", "ticker"}.issubset(old_out.columns):
-        for _rec in old_out.to_dict("records"):
-            _m = str(_rec.get("market", "")).upper()
-            _t = str(_rec.get("ticker", "")).zfill(6) if _m == "KR" else str(_rec.get("ticker", "")).upper()
-            old_lookup[(str(_rec.get("first_seen", "")), _m, _t)] = _rec
+    def identities(frame):
+        keys = frame[["first_seen", "market", "ticker"]].copy()
+        keys["market"] = keys.market.str.upper()
+        keys["ticker"] = keys.ticker.str.upper().where(keys.market != "KR", keys.ticker.str.zfill(6))
+        if keys.isna().any().any():
+            raise ValueError("missing signal/outcome identity")
+        return pd.MultiIndex.from_frame(keys)
+
+    for frame in (sig, old_out):
+        if not frame.empty and identities(frame).has_duplicates:
+            raise ValueError("ambiguous signal/outcome identity")
+    old_lookup = dict(zip(identities(old_out), old_out.to_dict("records"))) if not old_out.empty else {}
+    now = evaluated_at if evaluated_at is not None else datetime.now(timezone.utc)
 
     def _hret(frame: pd.DataFrame, entry_p: float, n: int, c_cost: float) -> float:
         return ((float(frame["Close"].iloc[n - 1]) / entry_p - 1.0) * 100.0 - c_cost) if len(frame) >= n else np.nan
@@ -4946,12 +5053,8 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
         l_key = (str(r.first_seen), mkt, tkr)
         prev_rec = old_lookup.get(l_key)
         if prev_rec is not None:
-            _old_bars = float(pd.to_numeric(prev_rec.get("bars", 0), errors="coerce") or 0.0)
-            _old_status = str(prev_rec.get("status", ""))
-            _has_sa = pd.notna(prev_rec.get("stop_aware_ret_10d", np.nan)) and str(prev_rec.get("stop_aware_ret_10d", "")) not in ("", "nan")
-            _has_10d_sep = pd.notna(prev_rec.get("mfe_10d_pct", np.nan)) and str(prev_rec.get("mfe_10d_pct", "")) not in ("", "nan")
-            # 이미 20거래일 평가 완료(종료) 및 10일/20일 분리 지표까지 모두 채워진 신호는 파일 I/O 없이 즉시 스킵
-            if _old_status == "종료" and _old_bars >= 20 and _has_sa and _has_10d_sep:
+            # Terminal rows, including legacy/incomplete terminal evidence, are audit-only.
+            if prev_rec.get("status") == "종료" or str(prev_rec.get("review_required")).lower() == "true":
                 continue
             # Existing KR results before the reviewed closure boundary are not
             # migrated in-place. A separately approved replay must retain lineage.
@@ -4965,7 +5068,9 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
 
         key = f"{mkt}:{tkr}"
         if key not in price_cache:
-            cpath = (KR_HISTORY_CACHE_DIR / f"{tkr}.pkl") if mkt == "KR" else (US_HISTORY_CACHE_DIR / f"{tkr}.pkl")
+            if mkt not in dirs or not re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{0,30}", tkr):
+                raise ValueError("invalid price cache identity")
+            cpath = dirs[mkt] / f"{tkr}.pkl"
             try:
                 frame = pd.read_pickle(cpath) if cpath.exists() else pd.DataFrame()
                 if not frame.empty:
@@ -4978,8 +5083,9 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
                     if frame.index.tz is not None: frame.index = frame.index.tz_localize(None)
                     frame = frame.loc[~frame.index.duplicated(keep="last")].sort_index()
                     zone = KST if mkt == "KR" else ZoneInfo("America/New_York")
-                    today = pd.Timestamp(datetime.now(timezone.utc).astimezone(zone).date())
-                    frame = trim_incomplete_bar(frame.loc[frame.index <= today], mkt, True)
+                    today = pd.Timestamp(now.astimezone(zone).date())
+                    frame = frame.loc[frame.index <= today]
+                    frame = frame.loc[(session_ready_times(frame.index, mkt) <= pd.Timestamp(now)).to_numpy()]
                 price_cache[key] = frame
             except Exception as _exc:
                 _swallow("update_signal_outcomes", _exc, tkr)
@@ -4994,31 +5100,67 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
             "ticker": tkr, "name": getattr(r, "name", ""), "sector": getattr(r, "sector", ""),
             "setup_stage": getattr(r, "setup_stage", ""), "tier": getattr(r, "tier", ""),
         }
+        if cutoffs is not None:
+            cutoff = cutoffs.get(base_row["track"])
+            if not cutoff:
+                continue
+            if not h.empty:
+                h = h.loc[h.index <= pd.Timestamp(cutoff)]
+        base_row.update(signal_run_id=getattr(r, "run_id", None), signal_config_hash=getattr(r, "config_hash", None),
+                        round_trip_cost_pct=cost, path_policy=FIXED_PATH_POLICY, calculation_version=CALCULATION_VERSION, calendar_policy=calendar_policy(mkt),
+                        bars=0, entry_session_verified=False, calendar_complete_5d=False,
+                        calendar_complete_10d=False, calendar_complete_20d=False, path_ohlc_complete_10d=False)
+
+        def wait_for(reason):
+            if prev_rec is None or pd.isna(prev_rec.get("entry_date")):
+                rows.append({**base_row, "status":reason})
+            elif not h.empty:
+                rows.append({**prev_rec, "entry_session_verified":False, "review_reason":reason})
+
         if h.empty or "Close" not in h.columns:
             if prev_rec is None:
-                rows.append({**base_row, "bars": 0, "status": "데이터없음"})
+                wait_for("데이터없음")
             continue
-
-        after = h.loc[h.index > as_of]
+        exchange = get_calendar(mkt)
+        if not exchange.is_session(as_of):
+            wait_for("신호 기준 거래일 검증 필요")
+            continue
+        entry = exchange.next_session(as_of)
+        if h.index[-1] < entry:
+            wait_for("대기")
+            continue
+        expected = exchange.sessions_in_range(entry, h.index[-1])[:20]
+        after = h.reindex(expected)
+        close = pd.to_numeric(after.Close, errors="coerce")
+        valid = close.gt(0) & np.isfinite(close)
+        if "IsHalt" in after:
+            valid &= ~after.IsHalt.astype(str).str.lower().isin(("true", "1", "1.0"))
+        basis = after.get("_base_price_basis", pd.Series(index=after.index, dtype=str))
+        valid &= basis.eq(OBSERVATION_BASIS[mkt]).fillna(False)
+        if "Stock Splits" in after:
+            valid &= pd.to_numeric(after["Stock Splits"], errors="coerce").fillna(0).eq(0)
+        invalid = np.flatnonzero(~valid.fillna(False))
+        if len(invalid):
+            after = after.iloc[:invalid[0]]
         if after.empty:
-            if prev_rec is None:
-                rows.append({**base_row, "bars": 0, "status": "대기"})
+            wait_for("진입일 확정 가격/조정 기준 미확보")
             continue
-        if prev_rec is not None:
-            _old_bars = float(pd.to_numeric(prev_rec.get("bars", 0), errors="coerce") or 0.0)
-            if _old_bars > len(after):
-                continue
-
         eb = after.iloc[0]
-        has_open = "Open" in after.columns and pd.notna(eb.get("Open")) and np.isfinite(float(eb["Open"])) and float(eb["Open"]) > 0
-        entry_p = float(eb["Open"]) if has_open else float(eb["Close"])
-        halt = str(eb.get("IsHalt", "false")).lower() in ("true", "1", "1.0")
-        raw_open = str(eb.get("_raw_open_valid", "")).lower() in ("true","1","1.0")
-        entry_source = ("open" if raw_open else "open_unverified") if has_open and not halt else "close_fallback_or_halt"
-        if not np.isfinite(entry_p) or entry_p <= 0:
-            if prev_rec is None:
-                rows.append({**base_row, "bars": 0, "status": "진입가격오류"})
+        entry_p = pd.to_numeric(eb.get("Open"), errors="coerce")
+        raw_open = str(eb.get("_raw_open_valid", "")).lower() in ("true", "1", "1.0")
+        if not raw_open or pd.isna(entry_p) or not np.isfinite(entry_p) or entry_p <= 0:
+            wait_for("진입일 원본 시가 미확보")
             continue
+        entry_source = "open"
+        old_bars = pd.to_numeric(prev_rec.get("bars"), errors="coerce") if prev_rec else 0
+        if prev_rec and old_bars > len(after):
+            rows.append({**prev_rec, "entry_session_verified":False, "review_reason":"기존 가격 경로 미확보"})
+            continue
+        if prev_rec and pd.notna(prev_rec.get("price_prefix_sha256")):
+            end = pd.Timestamp(prev_rec["evaluated_as_of"])
+            if _fixed_prefix_hash(h.loc[as_of:end]) != prev_rec["price_prefix_sha256"]:
+                rows.append({**prev_rec, "entry_session_verified":False, "review_required":True, "review_reason":"기존 가격 경로 수정 — 재검증 필요"})
+                continue
 
         try:
             stop = float(getattr(r, "stop_price", np.nan))
@@ -5037,15 +5179,6 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
         bdf = bench(str(getattr(r, "sub_market", "")).upper(), mkt)
         next_sessions = bdf.index[bdf.index > as_of] if not bdf.empty else pd.DatetimeIndex([])
         entry_session_verified = as_of in bdf.index and len(next_sessions)>0 and next_sessions[0]==eb.name
-        # Matching caches alone cannot detect a session missing from BOTH feeds.
-        # Keep reference returns, but certify timing against the exchange calendar.
-        exchange = None
-        try:
-            exchange = get_calendar(mkt)
-            entry_session_verified = bool(entry_session_verified and exchange.is_session(as_of)
-                                          and exchange.next_session(as_of) == eb.name)
-        except (ValueError, KeyError, OverflowError):
-            entry_session_verified = False
         if not bdf.empty and eb.name in bdf.index:
             bo = float(bdf.loc[eb.name, "Open"]) if "Open" in bdf and pd.notna(bdf.loc[eb.name, "Open"]) else np.nan
             if (str(bdf.loc[eb.name].get("IsHalt", "false")).lower() in ("true", "1", "1.0")
@@ -5054,13 +5187,8 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
             if np.isfinite(bo) and bo > 0:
                 for n in (5, 10, 20):
                     if len(after) >= n and after.index[n-1] in bdf.index and pd.notna(ret[n]):
-                        calendar_complete[n] = after.index[:n].tolist() == bdf.loc[(bdf.index >= eb.name) & (bdf.index <= after.index[n-1])].index.tolist()
-                        try:
-                            expected = exchange.sessions_in_range(eb.name, after.index[n-1]) if exchange is not None else []
-                            calendar_complete[n] = bool(calendar_complete[n] and entry_session_verified
-                                                       and after.index[:n].tolist() == list(expected))
-                        except (ValueError, KeyError, OverflowError):
-                            calendar_complete[n] = False
+                        benchmark_dates = bdf.loc[eb.name:after.index[n-1]].index
+                        calendar_complete[n] = entry_session_verified and after.index[:n].equals(benchmark_dates)
                         bc = float(bdf.loc[after.index[n-1], "Close"])
                         if np.isfinite(bc) and bc > 0:
                             ex[n] = ret[n] - (bc / bo - 1.0) * 100.0
@@ -5069,23 +5197,29 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
         recorded_close = pd.to_numeric(getattr(r, "signal_close", np.nan), errors="coerce")
         cached_close = float(h.loc[as_of, "Close"]) if as_of in h.index else np.nan
         stop_basis = "unverified"
-        if pd.notna(recorded_close) and recorded_close > 0 and np.isfinite(cached_close):
+        anchor_basis = h.at[as_of, "_base_price_basis"] if as_of in h.index and "_base_price_basis" in h else None
+        if str(anchor_basis) == OBSERVATION_BASIS[mkt] and pd.notna(recorded_close) and recorded_close > 0 and np.isfinite(cached_close):
             stop_basis = "matched" if abs(cached_close / recorded_close - 1.0) <= 1e-6 else "changed"
-        path_complete = len(win10) >= 10 and all(col in win10 and
-            pd.to_numeric(win10[col], errors="coerce").replace([np.inf, -np.inf], np.nan).gt(0).fillna(False).all()
-            for col in ("Open", "High", "Low", "Close"))
-        if "IsHalt" in win10:
-            path_complete = path_complete and not win10["IsHalt"].astype(str).str.lower().isin(("true","1","1.0")).any()
-        path_complete = path_complete and win10.get("_raw_ohlc_valid",pd.Series(index=win10.index,dtype=str)).astype(str).str.lower().isin(("true","1","1.0")).all()
-
+        raw = win.reindex(columns=["Open", "High", "Low", "Close"]).apply(pd.to_numeric, errors="coerce")
+        quality = np.isfinite(raw).all(axis=1) & raw.gt(0).all(axis=1)
+        quality &= raw.High.ge(raw[["Open", "Close"]].max(axis=1)) & raw.Low.le(raw[["Open", "Close"]].min(axis=1))
+        quality &= win.get("_raw_ohlc_valid", pd.Series(False, index=win.index)).astype(str).str.lower().isin(("true","1","1.0"))
+        path_complete = len(win10) == 10 and quality.iloc[:10].all()
+        valid_stop = bool(np.isfinite(stop) and 0 < stop < entry_p and stop_basis == "matched")
+        if not valid_stop:
+            risk_pct = np.nan
         # 별도 10거래일 손절 시뮬레이션: 갭 하락은 시가, 장중 터치는 stop 가격 체결로 계산.
         stop_aware_ret, stop_aware_r = np.nan, np.nan
-        stop_exit_reason, stop_exit_date = "손절가 미설정", ""
-        if np.isfinite(stop) and 0 < stop < entry_p:
+        stop_exit_reason, stop_exit_date = "손절 기준 검증 불가", ""
+        if valid_stop:
             _exit = np.nan
+            stop_exit_reason = "평가 진행"
             for _dt, _bar in after.iloc[:10].iterrows():
-                _op = float(_bar["Open"]) if "Open" in after.columns and pd.notna(_bar.get("Open")) else np.nan
-                _lo = float(_bar["Low"]) if "Low" in after.columns and pd.notna(_bar.get("Low")) else float(_bar["Close"])
+                if not quality.loc[_dt]:
+                    stop_exit_reason = "원본 OHLC 경로 미확보"
+                    break
+                _op = float(_bar["Open"])
+                _lo = float(_bar["Low"])
                 if np.isfinite(_op) and _op <= stop:
                     _exit = _op
                     stop_exit_reason = "갭하락 손절(시가)"
@@ -5105,10 +5239,15 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
                 stop_aware_ret = (_exit / entry_p - 1.0) * 100.0 - cost
                 stop_aware_r = stop_aware_ret / risk_pct if risk_pct > 0 else np.nan
 
-        rows.append({
+        status = "경로 대기" if len(invalid) else "진행"
+        if cutoffs and len(win) < 20 and win.index[-1] < pd.Timestamp(cutoff):
+            status = "경로 대기"
+        if len(win) == 20:
+            status = "종료" if all(calendar_complete.values()) and quality.all() else "가격 근거 대기"
+        proposed = {
             **base_row, "entry_date": eb.name.strftime("%Y-%m-%d"), "entry_price": entry_p,
             "stop_price": stop if np.isfinite(stop) else np.nan, "risk_pct": risk_pct,
-            "bars": int(len(after)), "status": "종료" if len(after) >= 20 else "진행",
+            "bars": int(len(after)), "status": status,
             "cur_ret": (float(after["Close"].iloc[min(len(after), 20) - 1]) / entry_p - 1.0) * 100.0 - cost,
             "ret_5d": ret[5], "ret_10d": ret[10], "ret_20d": ret[20],
             "ex_5d": ex[5], "ex_10d": ex[10], "ex_20d": ex[20],
@@ -5123,28 +5262,37 @@ def update_signal_outcomes(base: Path, cfg: dict) -> int:
             "stop_exit_reason": stop_exit_reason, "stop_exit_date": stop_exit_date,
             "calculation_version": CALCULATION_VERSION, "entry_price_source": entry_source,
             "calendar_policy": calendar_policy(mkt),
-            "stop_price_basis": stop_basis, "evaluated_as_of": h.index[-1].strftime("%Y-%m-%d"),
+            "stop_price_basis": stop_basis, "evaluated_as_of": win.index[-1].strftime("%Y-%m-%d"),
+            "price_prefix_sha256": _fixed_prefix_hash(h.loc[as_of:win.index[-1]]) if quality.all() else None,
             "path_ohlc_complete_10d": bool(path_complete),
             "entry_session_verified": bool(entry_session_verified),
             **{f"eval_date_{n}d": after.index[n-1].strftime("%Y-%m-%d") if len(after)>=n else None for n in (5,10,20)},
             **{f"calendar_complete_{n}d": calendar_complete[n] for n in (5,10,20)},
-        })
+        }
+        for suffix, complete in (("_10d", quality.iloc[:10].all()), ("", quality.all())):
+            if not complete:
+                for metric in ("mfe", "mae"):
+                    proposed[f"{metric}{suffix}_pct"] = np.nan
+            if not valid_stop or not complete:
+                proposed[f"stop_hit{suffix}"] = np.nan
+        conflicts = fixed_conflicts(prev_rec, proposed) if prev_rec and pd.notna(prev_rec.get("entry_date")) else []
+        if conflicts:
+            rows.append({**prev_rec, "entry_session_verified":False, "review_required":True, "review_reason":"기존 결과 차이: " + ", ".join(conflicts)})
+        else:
+            rows.append({**{k: v for k, v in (prev_rec or {}).items() if k not in OUTCOME_COLS}, **proposed})
 
-    new_out = pd.DataFrame(rows, columns=OUTCOME_COLS)
+    new_out = pd.DataFrame(rows).reindex(columns=list(dict.fromkeys([*OUTCOME_COLS, *old_out.columns])))
     if new_out.empty and out_path.exists():
         return len(old_out)  # Preserve complete/held histories byte-for-byte.
     if not old_out.empty:
         for col in OUTCOME_COLS:
             if col not in old_out.columns:
                 old_out[col] = np.nan
-        merged = pd.concat([old_out[OUTCOME_COLS], new_out], ignore_index=True)
+        merged = pd.concat([old_out, new_out], ignore_index=True)
     else:
         merged = new_out
     if not merged.empty:
-        key_cols = ["first_seen", "market", "ticker", "setup_stage"]
-        # CSV empty strings round-trip as NaN; both mean an unspecified stage.
-        merged["setup_stage"] = merged["setup_stage"].fillna("")
-        merged = merged.drop_duplicates(subset=key_cols, keep="last")
+        merged = merged.loc[~identities(merged).duplicated(keep="last")]
     tmp = out_path.with_suffix(".csv.tmp")
     merged.to_csv(tmp, index=False, encoding="utf-8")
     os.replace(tmp, out_path)
@@ -5311,6 +5459,13 @@ def _publish_artifacts(d_str: str, track_results: dict[str, pd.DataFrame], track
             return None
 
         latest, old = base / "latest", base / f".old-{run_id}"
+        if (latest / "manifest.json").exists():
+            prior = json.loads((latest / "manifest.json").read_text())
+            if prior["d_str"] > d_str or any(
+                date and (manifest["as_of"].get(track) or "") < date
+                for track, date in prior.get("as_of", {}).items()
+            ):
+                raise ValueError("이전 시장 시점으로 게시할 수 없습니다")
         had_latest = latest.exists()
         if had_latest:
             os.replace(latest, old)
@@ -5342,7 +5497,7 @@ def _publish_artifacts(d_str: str, track_results: dict[str, pd.DataFrame], track
                                  generated_at=manifest["generated_at"], run_id=run_id, regimes=regimes,
                                  config_hash=manifest["config_hash"])
             update_candidate_history(base, cand, d_str, int(pcfg.get("candidates_hist_days", 400)))
-            update_signal_outcomes(base, cfg)
+            update_signal_outcomes(base, cfg, cutoffs=manifest["as_of"])
             reg_rows = [{"as_of": v.get("as_of"), "track": k, "signal_light": v.get("signal_light"), "regime": v.get("regime"),
                          "benchmark": v.get("benchmark"), "benchmark_close": v.get("benchmark_close"), "benchmark_sma50": v.get("benchmark_sma50"),
                          "benchmark_sma200": v.get("benchmark_sma200"), "distribution_days_25d": v.get("distribution_days_25d"),
@@ -5378,10 +5533,16 @@ def _publish_artifacts(d_str: str, track_results: dict[str, pd.DataFrame], track
                 if not path.exists(): return pd.DataFrame()
                 raw = pd.read_pickle(path)
                 frame = kr_completed_cached_bars(path, raw) if market == "KR" else us_completed_cached_bars(path, raw)
+                basis = frame.get("_base_price_basis", pd.Series(index=frame.index, dtype=str))
+                frame = frame.loc[basis.eq(OBSERVATION_BASIS[market])]
                 if frame.empty: return frame
                 frame = frame.copy(); frame.index = pd.to_datetime(frame.index)
                 if frame.index.tz is not None: frame.index = frame.index.tz_localize(None)
-                return frame.loc[~frame.index.duplicated(keep="last")].sort_index()
+                tracks = _KR_SUBS if market == "KR" else _US_SUBS
+                dates = [manifest["as_of"].get(track) for track in tracks]
+                if any(not date for date in dates):
+                    return frame.iloc[:0]
+                return frame.loc[~frame.index.duplicated(keep="last") & (frame.index <= pd.Timestamp(min(dates)))].sort_index()
             updated = update_tracking(base, tracking_prices, datetime.now(timezone.utc),
                                       float(cfg.get("screen", {}).get("round_trip_cost_pct", .003))*100,
                                       run_id=run_id, generated_at=manifest["generated_at"])
@@ -5769,16 +5930,16 @@ def run_self_tests(cfg: dict) -> int:
         _g4["KR_HISTORY_CACHE_DIR"], _g4["US_HISTORY_CACHE_DIR"] = _r4 / "kr", _r4 / "us"
         try:
             (_r4 / "kr").mkdir(); (_r4 / "us").mkdir(); (_r4 / "pub" / "history").mkdir(parents=True)
-            _ix4 = pd.bdate_range("2026-09-01", periods=60)
+            _ix4 = get_calendar("US").sessions_in_range("2026-08-03", "2026-10-30")[:60]
             up = np.linspace(100, 130, 60); dn = np.r_[np.linspace(100, 100, 25), np.linspace(100, 80, 35)]
             for _tk, _c in (("AAA", up), ("BBB", dn)):
-                tag_raw_price_quality(pd.DataFrame({"Open": _c, "High": _c * 1.01, "Low": _c * 0.99, "Close": _c, "Volume": 1e6}, index=_ix4)).assign(_session_confirmed=True, _session_finality_version=2).to_pickle(_r4 / "us" / f"{_tk}.pkl")
+                tag_raw_price_quality(pd.DataFrame({"Open": _c, "High": _c * 1.01, "Low": _c * 0.99, "Close": _c, "Volume": 1e6}, index=_ix4)).assign(_session_confirmed=True, _session_finality_version=2, _base_price_basis=OBSERVATION_BASIS["US"]).to_pickle(_r4 / "us" / f"{_tk}.pkl")
             tag_raw_price_quality(pd.DataFrame({"Open": np.linspace(100, 105, 60), "High": np.linspace(100, 105, 60), "Low": np.linspace(100, 105, 60),
-                          "Close": np.linspace(100, 105, 60), "Volume": 1e6}, index=_ix4)).assign(_session_confirmed=True, _session_finality_version=2).to_pickle(_r4 / "us" / "SPY.pkl")
+                          "Close": np.linspace(100, 105, 60), "Volume": 1e6}, index=_ix4)).assign(_session_confirmed=True, _session_finality_version=2, _base_price_basis=OBSERVATION_BASIS["US"]).to_pickle(_r4 / "us" / "SPY.pkl")
             _asof4 = _ix4[5].strftime("%Y-%m-%d")
             _sig4 = pd.DataFrame([
-                {"first_seen": _asof4, "as_of": _asof4, "market": "US", "sub_market": "SP500", "ticker": "AAA", "name": "A", "sector": "S", "setup_stage": "x", "tier": "A", "entry_ref": 100, "stop_price": 95, "rs_score": 90, "topdown_score": 80},
-                {"first_seen": _ix4[24].strftime("%Y-%m-%d"), "as_of": _ix4[24].strftime("%Y-%m-%d"), "market": "US", "sub_market": "SP500", "ticker": "BBB", "name": "B", "sector": "S", "setup_stage": "y", "tier": "B", "entry_ref": 100, "stop_price": 95, "rs_score": 80, "topdown_score": 70},
+                {"first_seen": _asof4, "as_of": _asof4, "market": "US", "sub_market": "SP500", "ticker": "AAA", "name": "A", "sector": "S", "setup_stage": "x", "tier": "A", "entry_ref": 100, "signal_close": up[5], "stop_price": 95, "rs_score": 90, "topdown_score": 80},
+                {"first_seen": _ix4[24].strftime("%Y-%m-%d"), "as_of": _ix4[24].strftime("%Y-%m-%d"), "market": "US", "sub_market": "SP500", "ticker": "BBB", "name": "B", "sector": "S", "setup_stage": "y", "tier": "B", "entry_ref": 100, "signal_close": dn[24], "stop_price": 95, "rs_score": 80, "topdown_score": 70},
                 {"first_seen": _ix4[-2].strftime("%Y-%m-%d"), "as_of": _ix4[-1].strftime("%Y-%m-%d"), "market": "US", "sub_market": "SP500", "ticker": "AAA", "name": "A", "sector": "S", "setup_stage": "z", "tier": "A", "entry_ref": 130, "stop_price": 120, "rs_score": 90, "topdown_score": 80},
             ])
             _sig4.to_csv(_r4 / "pub" / "history" / "signals.csv", index=False)
