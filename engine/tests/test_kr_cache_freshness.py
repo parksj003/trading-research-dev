@@ -36,6 +36,7 @@ def context(tmp_path, monkeypatch):
         return raw(bars('2026-11-04').loc[start:end])
     stock.get_index_ohlcv_by_date = stock.get_market_ohlcv_by_date = fetch
     monkeypatch.setitem(sys.modules, 'pykrx', SimpleNamespace(stock=stock))
+    monkeypatch.setattr(engine, 'ROOT', tmp_path)
     monkeypatch.setattr(engine, 'KR_HISTORY_CACHE_DIR', tmp_path)
     def clock(value='2026-11-04T17:13:00+09:00'):
         fixed = datetime.fromisoformat(value)
