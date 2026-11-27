@@ -379,3 +379,41 @@ def test_split_after_a_known_exit_keeps_the_earlier_event(cached):
     r = run(stock)
     assert r.bars == 11 and r.stop_exit_date == str(stock.index[3].date())
     assert pd.notna(r.ret_10d) and pd.isna(r.ret_20d)
+
+
+def test_intermediate_publication_preserves_reverted_facts_and_missing_rows(tmp_path):
+    import hashlib
+    import json
+    from watchlist import outcome_review
+
+    def write_snapshot(day, entry, include_second):
+        base = tmp_path / str(day)
+        manifest = {"run_id": str(day), "generated_at": f"2026-10-{day}T22:00Z", "config_hash": "synthetic"}
+        for name in ("analysis", "latest", "history"):
+            (base / name).mkdir(parents=True)
+        (base / "latest/manifest.json").write_text(json.dumps(manifest))
+        tickers = ["EXA", "EXB"] if include_second else ["EXA"]
+        rows = pd.DataFrame([{"first_seen": "2026-10-01", "market": "US", "ticker": ticker} for ticker in tickers])
+        source = {**manifest, "history_update_ok": True, "history_sources": {}}
+        for name, frame in (("signals.csv", rows), ("signal_outcomes.csv", rows.assign(entry_price=entry))):
+            path = base / "history" / name
+            frame.to_csv(path, index=False)
+            source["history_sources"][name] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        (base / "analysis/latest.md").write_text('````json\n' + json.dumps({"source": source}) + '\n````')
+        return base
+
+    first = write_snapshot(12, 100., True)
+    middle = write_snapshot(13, 98., False)
+    last = outcome_review.snapshot(write_snapshot(14, 100., True))
+    _, _, direct = outcome_review.compare_publications(first, [], last)
+    assert direct[0]["outcome_changes"] == [] and direct[0]["removed_signals"] == []
+    _, _, intervals = outcome_review.compare_publications(first, [middle], last)
+    assert [x["outcome_changes"][0]["values"]["entry_price"] for x in intervals] == [
+        ["100.0", "98.0"], ["98.0", "100.0"]]
+    assert intervals[0]["removed_signals"] == intervals[0]["removed_outcomes"]
+    assert [r["ticker"] for r in intervals[0]["removed_outcomes"]] == ["EXB"]
+    assert intervals[0]["to_manifest_sha256"] == intervals[1]["from_manifest_sha256"]
+    with pytest.raises(ValueError, match="increasing"):
+        outcome_review.compare_publications(first, [middle, first], last)
+    with pytest.raises(ValueError, match="require a previous"):
+        outcome_review.compare_publications(None, [middle], last)

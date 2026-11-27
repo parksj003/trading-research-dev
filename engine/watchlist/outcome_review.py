@@ -48,16 +48,48 @@ def snapshot(base):
     return manifest, report, *frames, hashlib.sha256(raw_manifest).hexdigest()
 
 
-def review(published, data, start, previous=None):
-    manifest, report, signals, outcomes, manifest_hash = snapshot(published)
+def compare_publications(previous, intermediate, latest):
+    if previous is None:
+        if intermediate:
+            raise ValueError("intermediate publications require a previous publication")
+        return {}, None, []
+
+    older = snapshot(previous)
+    baseline_hash = older[4]
+    previous_rows = baseline = older[3].set_index(KEY).to_dict("index")
+    intervals = []
+    for path in (*intermediate, None):
+        newer = latest if path is None else snapshot(path)
+        if pd.Timestamp(older[0]["generated_at"]) >= pd.Timestamp(newer[0]["generated_at"]):
+            raise ValueError("publications must be supplied in strictly increasing time order")
+        current_rows = newer[3].set_index(KEY).to_dict("index")
+        changes = []
+        for key in sorted(previous_rows.keys() & current_rows.keys()):
+            before, after = previous_rows[key], current_rows[key]
+            fields = engine.fixed_conflicts(before, after)
+            if fields:
+                changes.append({
+                    **dict(zip(KEY, key)),
+                    "values": {f: [before[f], after[f] if pd.notna(after.get(f)) else None] for f in fields},
+                })
+        old_signals = older[2].set_index(KEY).index
+        new_signals = newer[2].set_index(KEY).index
+        intervals.append({
+            "from_run_id": older[0]["run_id"], "to_run_id": newer[0]["run_id"],
+            "from_manifest_sha256": older[4], "to_manifest_sha256": newer[4],
+            "outcome_changes": changes,
+            "removed_signals": [dict(zip(KEY, k)) for k in old_signals.difference(new_signals)],
+            "removed_outcomes": [dict(zip(KEY, k)) for k in sorted(previous_rows.keys() - current_rows.keys())],
+        })
+        previous_rows, older = current_rows, newer
+    return baseline, baseline_hash, intervals
+
+
+def review(published, data, start, previous=None, intermediate=()):
+    latest = snapshot(published)
+    manifest, report, signals, outcomes, manifest_hash = latest
     cutoff = pd.Timestamp(manifest["generated_at"])
-    prior = {}
-    prior_hash = None
-    if previous:
-        older, _, _, old_rows, prior_hash = snapshot(previous)
-        if pd.Timestamp(older["generated_at"]) >= cutoff:
-            raise ValueError("previous publication must precede current")
-        prior = old_rows.set_index(KEY).to_dict("index")
+    prior, prior_hash, intervals = compare_publications(previous, intermediate, latest)
     current = outcomes.set_index(KEY).to_dict("index")
     cost = float(report["validation"]["policy"]["round_trip_cost_pct"])
     if not 0 <= cost < 100:
@@ -133,7 +165,7 @@ def review(published, data, start, previous=None):
         "market_cutoffs": manifest["as_of"], "price_files_sha256": price_hashes,
         "evaluated_at": cutoff.isoformat(), "from_session": str(start.date()), "round_trip_cost_pct": cost,
         "calculation_version": engine.CALCULATION_VERSION, "path_policy": engine.FIXED_PATH_POLICY,
-        "records": records,
+        "publication_intervals": intervals, "records": records,
     }
 
 
@@ -141,10 +173,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--published", required=True, type=Path)
     parser.add_argument("--previous", type=Path, help="last good pinned published directory")
+    parser.add_argument("--intermediate", type=Path, action="append", default=[],
+                        help="pinned intervening publication, repeat in chronological order")
     parser.add_argument("--data", required=True, type=Path, help="trusted core cache directory")
     parser.add_argument("--from-session", required=True, type=pd.Timestamp)
     args = parser.parse_args()
-    result = review(args.published, args.data, args.from_session, args.previous)
+    result = review(args.published, args.data, args.from_session, args.previous, args.intermediate)
     print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
 
 
