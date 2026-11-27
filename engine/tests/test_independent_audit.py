@@ -44,7 +44,7 @@ def test_a01_legacy_and_primary_have_different_dates_and_publication_requirement
     monkeypatch.setattr(engine, 'US_HISTORY_CACHE_DIR', cache)
     dates = pd.bdate_range('2026-10-01', periods=15)
     benchmark = prices(dates); benchmark['Close'] += np.arange(len(dates))
-    stock = prices(dates.delete(3))  # A stock session is absent, benchmark remains complete.
+    stock = prices(dates.delete(3)).assign(_base_price_basis="yfinance:auto_adjust=True")  # A stock session is absent, benchmark remains complete.
     stock.to_pickle(cache/'EX.pkl')
     monkeypatch.setattr(engine, '_make_bench_getter', lambda _: lambda *args: benchmark)
     rows = [dict(date=date, as_of=date, market='US', sub_market='SP500', ticker='EX',
@@ -60,7 +60,7 @@ def test_a01_legacy_and_primary_have_different_dates_and_publication_requirement
     engine.update_signal_outcomes(tmp_path/'published',cfg)
     outcomes = pd.read_csv(history/'signal_outcomes.csv')
     assert outcomes.iloc[0]['calendar_complete_10d'] == False
-    assert outcomes.iloc[0]['ex_10d'] != legacy.iloc[-1]['avg_ex_10d']
+    assert pd.isna(outcomes.iloc[0]['ex_10d']) and pd.notna(legacy.iloc[-1]['avg_ex_10d'])
     result = research.validation_statistics(pd.DataFrame([signal]),outcomes,
                                            {'as_of':{'SP500':'2026-11-03'}})
     assert result['quality']['entry_before_signal'] == 1
@@ -213,7 +213,7 @@ def test_a06_new_verified_cohort_matures_without_promoting_legacy_or_rewriting_s
         last=days[bars]
         at=last.tz_localize('America/New_York')+pd.Timedelta(hours=18)
         fixed_clock(monkeypatch,at.isoformat())
-        frame=prices(days[:bars+1])
+        frame=prices(days[:bars+1]).assign(_base_price_basis="yfinance:auto_adjust=True")
         frame.to_pickle(cache/'EX.pkl');frame.to_pickle(cache/'SPY.pkl')
         engine.update_signal_outcomes(base,cfg)
         outcomes=pd.read_csv(base/'history/signal_outcomes.csv')

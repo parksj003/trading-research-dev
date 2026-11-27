@@ -13,6 +13,7 @@ from watchlist.analysis_report import CALCULATION_VERSION, _availability
 def prices(dates, start=100.):
     d=pd.DataFrame(index=pd.to_datetime(dates))
     d['Open']=start;d['Close']=start+np.arange(len(d));d['High']=d['Close']+2;d['Low']=start-2
+    d['_base_price_basis']='yfinance:auto_adjust=True'
     d['_session_finality_version']=2
     d['_session_confirmed']=True
     d['_raw_open_valid']=True;d['_raw_ohlc_valid']=True
@@ -58,8 +59,8 @@ def test_benchmark_uses_the_stocks_actual_exit_date_when_sessions_are_missing(ca
     benchmark=prices(pd.bdate_range('2026-10-01',periods=7))
     benchmark['Close']=[100,101,102,103,104,105,125]
     r=run(stock,benchmark)
-    assert r['eval_date_5d']=='2026-10-09'
-    assert r['ex_5d']==pytest.approx(4.7-25.)  # Same exit date; old Nth benchmark row would give 4.7-5.
+    assert r['bars']==2 and pd.isna(r['eval_date_5d'])
+    assert pd.isna(r['ex_5d'])
     assert not bool(r['calendar_complete_5d'])  # Missing stock bars cannot certify five market sessions.
 
 
@@ -105,6 +106,7 @@ def test_only_confirmed_daily_bars_are_evaluated_in_each_timezone(cached,monkeyp
         def now(cls,tz=None):return datetime(day.year,day.month,day.day,utc_hour,utc_minute,tzinfo=timezone.utc).astimezone(tz)
     monkeypatch.setattr(engine,'datetime',Clock)
     stock=prices([day-timedelta(days=1),day,day+timedelta(days=1)])
+    stock["_base_price_basis"] = engine.OBSERVATION_BASIS[market]
     r=run(stock,market=market,ticker='123456' if market=='KR' else 'EX',
           sub_market='KOSPI' if market=='KR' else 'SP500',as_of=(day-timedelta(days=1)).strftime('%Y-%m-%d'))
     assert r['bars']==int(closed)  # Both an unfinished bar and a future cached bar are excluded.
@@ -164,7 +166,7 @@ def test_changed_adjustment_basis_is_flagged_without_rebasing_the_historical_sto
 def test_missing_open_fallback_is_disclosed_and_missing_cache_does_not_erase_prior_progress(cached):
     root,run=cached;stock=prices(pd.bdate_range('2026-10-01',periods=6)).drop(columns='Open')
     r=run(stock)
-    assert r['entry_price_source']=='close_fallback_or_halt'
+    assert pd.isna(r['entry_price']) and r['status']=='진입일 원본 시가 미확보'
     original=(root/'history/signal_outcomes.csv').read_bytes()
     (root/'prices/EX.pkl').unlink();run(None)
     assert (root/'history/signal_outcomes.csv').read_bytes()==original
@@ -218,6 +220,200 @@ def test_price_quality_metadata_does_not_change_existing_strategy_features():
 def test_missing_first_session_cannot_turn_a_later_price_into_next_session_entry(cached):
     _,run=cached;b=prices(pd.bdate_range('2026-10-01',periods=8));stock=b.drop(index=b.index[1])
     r=run(stock,b)
-    assert r['entry_date']=='2026-10-05'  # Existing first-observed-price proxy is preserved.
+    assert pd.isna(r['entry_date']) and r['bars']==0
     assert not bool(r['entry_session_verified'])
 
+
+
+def test_recovered_published_signal_matches_daily_runs_through_entry_stop_and_maturity(tmp_path):
+    from watchlist import trend_tracking
+    from test_exit_policy_core import fixture
+    from watchlist.exit_policy_experiments import prepare, simulate
+
+    signal, full, cutoff = fixture(length=20)
+    days = full.index[full.index > pd.Timestamp(signal["as_of"])]
+    full.loc[days[2], ["Open", "Low"]] = [85., 80.]
+    full.loc[days[3]:, ["High", "Close"]] = [125., 120.]
+    cal = engine.get_calendar("US")
+    def execute(root, bars, clock):
+        hist = root / "history"
+        hist.mkdir(parents=True, exist_ok=True)
+        if not (hist / "signals.csv").exists():
+            pd.DataFrame([signal]).to_csv(hist / "signals.csv", index=False)
+        cache = root / "cache"
+        cache.mkdir(exist_ok=True)
+        bars.to_pickle(cache / "SYNTH.pkl")
+        full.to_pickle(cache / "SPY.pkl")
+        engine.update_signal_outcomes(root, engine.DEFAULT_CONFIG, evaluated_at=clock, price_dirs={"US":cache,"KR":cache})
+        trend_tracking.update_tracking(root, lambda *args:bars, clock, run_id=clock.isoformat(), generated_at=clock.isoformat())
+        return pd.read_csv(hist / "signal_outcomes.csv")
+
+    daily, recovery = tmp_path / "daily", tmp_path / "recovery"
+    for day in days:
+        reference = execute(daily, full.loc[:day], cal.session_close(day) + pd.Timedelta(hours=1))
+    # No publication during the gap. A partial provider response lacks the stop day.
+    assert execute(recovery, full.drop(days[0]), cutoff).iloc[0].bars == 0
+    partial = execute(recovery, full.drop(days[2]), cutoff).iloc[0]
+    assert partial.bars == 2 and pd.isna(partial.stop_exit_date)
+    recovered = execute(recovery, full, cutoff)
+    pd.testing.assert_frame_equal(reference, recovered)
+    assert recovered.iloc[0].stop_exit_date == days[2].date().isoformat()
+    assert recovered.iloc[0].stop_aware_ret_10d == pytest.approx(-15.3)
+    assert recovered.iloc[0].ret_20d == pytest.approx(19.7)
+    for file in ("signals.csv", "signal_outcomes.csv"):
+        assert (recovery/"history"/file).read_bytes() == (daily/"history"/file).read_bytes()
+    def daily_rows(root):
+        return pd.read_csv(root/"history/trend_tracking_daily.csv.gz")
+    a, b = daily_rows(daily), daily_rows(recovery)
+    assert len(b) == 20 and b.recorded_at.nunique() == 1 and a.recorded_at.nunique() == 20
+    pd.testing.assert_frame_equal(a.drop(columns=["recorded_at","tracking_run_id"]), b.drop(columns=["recorded_at","tracking_run_id"]))
+    research = simulate(prepare(signal, full, cutoff), "FIXED", 20)
+    assert research["exit_fill_date"] == recovered.iloc[0].stop_exit_date
+    assert research["net_return_pct"] == pytest.approx(recovered.iloc[0].stop_aware_ret_10d)
+    pd.testing.assert_frame_equal(execute(recovery, full, cutoff), recovered)
+
+
+def test_live_price_revision_preserves_published_facts_and_withholds_statistics(cached):
+    from watchlist.analysis_report import validation_statistics
+    _, run = cached
+    bars = prices(pd.bdate_range("2026-10-01", periods=16))
+    before = run(bars.iloc[:11])
+    bars.loc[bars.index[3], "Low"] = 85.
+    held = run(bars)
+    for field in ("entry_price", "ret_10d", "stop_aware_ret_10d", "stop_exit_date"):
+        assert held[field] == before[field]
+    assert held["review_reason"] and held.review_required and not held.entry_session_verified
+    bars.loc[bars.index[3], "Low"] = 98.
+    assert run(bars).review_required  # Only explicit review can release a recorded revision.
+    signal = {**held.to_dict(), "published_at":"2026-10-01T22:00Z"}
+    report = validation_statistics(pd.DataFrame([signal]), held.to_frame().T,
+                                   {"as_of":{"SP500":"2026-10-30"}, "d_str":"2026-10-30"})
+    assert report["quality"]["entry_eligible_rows"] == 0
+
+
+def test_close_only_middle_bar_cannot_prove_a_stop_and_can_later_be_completed(cached):
+    _, run = cached
+    stock = prices(pd.bdate_range("2026-10-01", periods=21))
+    stock.loc[stock.index[2], "Low"] = 85
+    partial = stock.copy()
+    partial.loc[stock.index[2], "_raw_ohlc_valid"] = False
+    r = run(partial)
+    assert pd.isna(r.stop_aware_ret_10d) and pd.isna(r.stop_hit_10d)
+    assert pd.isna(r.mfe_10d_pct) and pd.notna(r.ret_20d) and r.status != "종료"
+    r = run(stock)
+    assert r.status == "종료" and r.stop_aware_ret_10d == pytest.approx(-10.3)
+
+
+def test_price_only_subscribers_survive_a_pause_across_the_observation_limit(tmp_path, monkeypatch):
+    import json
+    cfg = deepcopy(engine.DEFAULT_CONFIG)
+    monkeypatch.setattr(engine, "ROOT", tmp_path)
+    hist = tmp_path / "published/history"
+    latest = tmp_path / "published/latest"
+    hist.mkdir(parents=True)
+    latest.mkdir()
+    (latest/"manifest.json").write_text(json.dumps({"as_of":{"SP500":"2026-03-03"}}))
+    pd.DataFrame([{"market":"US","first_seen":d,"ticker":t} for d,t in (
+        ("2026-02-27","REMOVED"), ("2026-03-02","REMOVED"), ("2023-01-03","OLD"))]
+        ).to_csv(hist/"signals.csv",index=False)
+    assert engine.observation_tickers(cfg, "US") == {"REMOVED"}
+
+
+def test_offline_review_rechecks_sealed_row_and_rejects_mixed_history(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    from watchlist import outcome_review
+    from test_analysis_report import write_market
+
+    manifest = write_market(tmp_path)
+    (tmp_path/"latest/manifest.json").write_text(json.dumps({**manifest, "config_hash":"synthetic"}))
+    dates = pd.bdate_range("2026-10-01", periods=21)
+    cache = tmp_path / "data/us_history_cache"
+    cache.mkdir(parents=True)
+    stock = prices(dates)
+    stock.to_pickle(cache/"EXA.pkl")
+    stock.to_pickle(cache/"SPY.pkl")
+    hist = tmp_path/"history"
+    signals = pd.read_csv(hist/"signals.csv").iloc[:1].assign(as_of="2026-10-01", sub_market="SP500", signal_close=100., stop_price=90.)
+    signals.to_csv(hist/"signals.csv", index=False)
+    (hist/"signal_outcomes.csv").unlink()
+    engine.update_signal_outcomes(tmp_path, engine.DEFAULT_CONFIG, price_dirs={"US":cache, "KR":cache},
+                                 evaluated_at=pd.Timestamp("2026-11-03T20:00Z"))
+    outcome = pd.read_csv(hist/"signal_outcomes.csv").iloc[0]
+    assert outcome.status == "종료"
+    from watchlist.analysis_report import publish_analysis_report
+    publish_analysis_report(tmp_path, round_trip_cost_pct=.3)
+    stock.loc[dates[2],"Low"] = 85
+    stock.to_pickle(cache/"EXA.pkl")
+    def hashes():
+        return {p:hashlib.sha256(p.read_bytes()).digest() for p in tmp_path.rglob("*") if p.is_file()}
+    original = hashes()
+    review = outcome_review.review(tmp_path,tmp_path/"data",dates[1])
+    assert len(review["records"]) == 1
+    row = review["records"][0]
+    assert row["cache_proposal"]["stop_exit_date"] == str(dates[2].date())
+    assert "stop_aware_ret_10d" in row["conflicting_fields"] and row["stored"]["status"] == "종료"
+    assert original == hashes()
+    with (hist/"signals.csv").open("a") as stream:
+        stream.write("\n")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        outcome_review.review(tmp_path,tmp_path/"data",dates[1])
+
+
+def test_unknown_price_basis_in_prefix_cannot_invent_a_split_day_stop(cached):
+    _, run = cached
+    stock = prices(pd.bdate_range("2026-10-01", periods=11))
+    stock.loc[stock.index[3], ["Open","High","Low","Close"]] = [50.,52.,49.,51.]
+    partial = stock.copy()
+    partial.loc[stock.index[3], "_base_price_basis"] = None
+    held = run(partial)
+    assert held.bars == 2 and pd.isna(held.stop_exit_date) and pd.isna(held.ret_5d)
+
+
+def test_split_after_a_known_exit_keeps_the_earlier_event(cached):
+    _, run = cached
+    stock = prices(pd.bdate_range("2026-10-01", periods=16))
+    stock.loc[stock.index[3], "Low"] = 85.
+    stock["Stock Splits"] = 0.
+    stock.loc[stock.index[12], "Stock Splits"] = 2.
+    r = run(stock)
+    assert r.bars == 11 and r.stop_exit_date == str(stock.index[3].date())
+    assert pd.notna(r.ret_10d) and pd.isna(r.ret_20d)
+
+
+def test_intermediate_publication_preserves_reverted_facts_and_missing_rows(tmp_path):
+    import hashlib
+    import json
+    from watchlist import outcome_review
+
+    def write_snapshot(day, entry, include_second):
+        base = tmp_path / str(day)
+        manifest = {"run_id": str(day), "generated_at": f"2026-10-{day}T22:00Z", "config_hash": "synthetic"}
+        for name in ("analysis", "latest", "history"):
+            (base / name).mkdir(parents=True)
+        (base / "latest/manifest.json").write_text(json.dumps(manifest))
+        tickers = ["EXA", "EXB"] if include_second else ["EXA"]
+        rows = pd.DataFrame([{"first_seen": "2026-10-01", "market": "US", "ticker": ticker} for ticker in tickers])
+        source = {**manifest, "history_update_ok": True, "history_sources": {}}
+        for name, frame in (("signals.csv", rows), ("signal_outcomes.csv", rows.assign(entry_price=entry))):
+            path = base / "history" / name
+            frame.to_csv(path, index=False)
+            source["history_sources"][name] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        (base / "analysis/latest.md").write_text('````json\n' + json.dumps({"source": source}) + '\n````')
+        return base
+
+    first = write_snapshot(12, 100., True)
+    middle = write_snapshot(13, 98., False)
+    last = outcome_review.snapshot(write_snapshot(14, 100., True))
+    _, _, direct = outcome_review.compare_publications(first, [], last)
+    assert direct[0]["outcome_changes"] == [] and direct[0]["removed_signals"] == []
+    _, _, intervals = outcome_review.compare_publications(first, [middle], last)
+    assert [x["outcome_changes"][0]["values"]["entry_price"] for x in intervals] == [
+        ["100.0", "98.0"], ["98.0", "100.0"]]
+    assert intervals[0]["removed_signals"] == intervals[0]["removed_outcomes"]
+    assert [r["ticker"] for r in intervals[0]["removed_outcomes"]] == ["EXB"]
+    assert intervals[0]["to_manifest_sha256"] == intervals[1]["from_manifest_sha256"]
+    with pytest.raises(ValueError, match="increasing"):
+        outcome_review.compare_publications(first, [middle, first], last)
+    with pytest.raises(ValueError, match="require a previous"):
+        outcome_review.compare_publications(None, [middle], last)

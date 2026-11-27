@@ -292,3 +292,30 @@ def test_bulk_replaces_intraday_rows_without_per_stock_full_download(context):
         engine.fetch_kr_history(t, 3, cfg=cfg)
     assert calls == []
 
+
+
+def test_bulk_skips_a_missing_middle_session_then_uses_adjusted_date_history(context):
+    cfg, calls, stock, _, clock = context
+    tickers, paths, _ = bulk_context(context)
+    clock('2026-11-06T17:13:00+09:00')
+    snapshot = stock.get_market_ohlcv_by_ticker
+    def partial(date, **kwargs):
+        result = snapshot(date, **kwargs)
+        return result.drop(tickers[-1]) if date == '20261105' else result
+    stock.get_market_ohlcv_by_ticker = partial
+    original = paths[tickers[-1]].read_bytes()
+    state = engine.bulk_sync_kr_recent_ohlcv(tickers, cfg)
+    assert paths[tickers[-1]].read_bytes() == original and state['snapshot_available']
+    assert pd.read_pickle(paths[tickers[0]]).index[-1] == pd.Timestamp('2026-11-06')
+
+
+def test_incomplete_adjusted_replacement_preserves_old_cache(context):
+    cfg, calls, stock, cache, _ = context
+    path = cache()
+    original = path.read_bytes()
+    def truncated(start, end, ticker):
+        calls.append(start)
+        return raw(bars('2026-11-04').tail(3) * 2)
+    stock.get_market_ohlcv_by_date = truncated
+    result = engine.fetch_kr_history('005930', 3, cfg=cfg)
+    assert len(calls) == 2 and not result.empty and path.read_bytes() == original

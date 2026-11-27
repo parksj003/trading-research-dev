@@ -149,12 +149,8 @@ def test_existing_fixed_horizon_and_signal_calculation_sources_remain_unchanged(
     from pathlib import Path
     from watchlist import trend_watchlist as engine
     source=Path(engine.__file__).read_text();lines=source.splitlines(keepends=True)
-    # Source lock renewed only for the reviewed outcome changes: shared calendar,
-    # legacy freeze, additive policy provenance and missing-stage deduplication.
-    # Tactical audit: signal entry_ref now includes the exact -2.5% boundary.
-    # Only that lock changes; cooldown, historical rows and outcome math are preserved.
-    # evidence/verify_contracts.py additionally compares the return/stop AST to v1.
-    expected={'compute_forward_validation': '487d61502136b6842677567f8edd72a0e4858937186015631370828f15518d96', 'update_signal_ledger': '9bc373ec9e414de5b1369f8bf8361bdfe7b54232ae3ba704945e5a5f8ab00e44', 'update_signal_outcomes': '446eb7109d43f0c5d95e099a932d77bb38ce64439db81b80e039717c6efabfbe'}
+    # Renew the outcome lock after the continuous-versus-recovered replay in test_forward_outcomes.
+    expected={'compute_forward_validation': '487d61502136b6842677567f8edd72a0e4858937186015631370828f15518d96', 'update_signal_ledger': '9bc373ec9e414de5b1369f8bf8361bdfe7b54232ae3ba704945e5a5f8ab00e44', 'update_signal_outcomes': '6fdbdce9dd87fdbc6508b549b02cf27a958eca9048351d7d7c8631924a629c29'}
     for node in ast.parse(source).body:
         if isinstance(node,ast.FunctionDef) and node.name in expected:
             assert hashlib.sha256(''.join(lines[node.lineno-1:node.end_lineno]).encode()).hexdigest()==expected[node.name]
@@ -173,6 +169,7 @@ def test_fixed_outcome_completed_while_long_tracking_continues(tmp_path,monkeypa
     from datetime import datetime
     from watchlist import trend_watchlist as engine
     s,h,now=fixture(21);hist=tmp_path/'history';hist.mkdir();prices=tmp_path/'prices';prices.mkdir()
+    h['_base_price_basis']='yfinance:auto_adjust=True'
     h['_session_finality_version']=2;h.to_pickle(prices/'TEST.pkl')
     pd.DataFrame([s]).to_csv(hist/'signals.csv',index=False)
     monkeypatch.setattr(engine,'US_HISTORY_CACHE_DIR',prices)

@@ -107,3 +107,10 @@ def test_ten_day_distribution_gates_unknown_mfe_and_mae():
     assert filtered['mae_10d_pct'].isna().all()
     assert app.outcome_metrics(filtered)['MAE 평가']==0
 
+
+
+def test_review_hold_excludes_preserved_results():
+    from app import clean_validation_metrics
+    frame = pd.DataFrame([dict(bars=20, ret_10d=10., review_reason="price revision",
+        calendar_complete_10d=True, calculation_version="fixed_horizon_dates_v2")])
+    assert pd.isna(clean_validation_metrics(frame).iloc[0].ret_10d)
