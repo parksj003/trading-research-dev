@@ -61,6 +61,7 @@ concurrency:
 
 env:
   TZ: Asia/Seoul
+  PORTFOLIO_SNAPSHOT_ENABLED: 'false'
 
 jobs:
   collect-data:
@@ -82,13 +83,22 @@ jobs:
             watchlist/session_calendar.py
             settings.yml
             requirements.txt
+            requirements-journal.txt
           sparse-checkout-cone-mode: false
+
+      - name: Select journal dependencies
+        env:
+          REQUIREMENTS: ${{ (inputs.mode == 'auto' || inputs.mode == 'hourly_check') && env.PORTFOLIO_SNAPSHOT_ENABLED == 'false' && 'requirements-journal.txt' || 'requirements.txt' }}
+        run: echo "JOURNAL_REQUIREMENTS=$REQUIREMENTS" >> "$GITHUB_ENV"
 
       - name: Python 환경 설정
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: |
+            requirements-journal.txt
+            ${{ env.JOURNAL_REQUIREMENTS }}
 
       - name: 캐시 복원 (일봉 데이터)
         uses: actions/cache/restore@v4
@@ -101,14 +111,11 @@ jobs:
             nh-token-
 
       - name: 필수 라이브러리 설치
-        run: pip install -r requirements.txt
+        run: python -m pip install -r "$JOURNAL_REQUIREMENTS"
 
       - name: 자동 매매일지 스크립트 실행
         env:
           PORTFOLIO_EQUITY_AS_OF: ${{ vars.PORTFOLIO_EQUITY_AS_OF }}
-          # Keep trade sync and legacy risk alerts; disable automatic snapshots.
-          # Explicit portfolio mode remains available for manual refreshes.
-          PORTFOLIO_SNAPSHOT_ENABLED: 'false'
           PYTHONUNBUFFERED: '1'
           NH_APP_KEY: ${{ secrets.NH_APP_KEY }}
           NH_APP_SECRET: ${{ secrets.NH_APP_SECRET }}

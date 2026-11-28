@@ -29,6 +29,7 @@ jobs:
           cache-dependency-path: |
             requirements-dev.txt
             engine/requirements.txt
+            engine/requirements-journal.txt
             app/requirements.txt
       - uses: actions/setup-node@v4
         if: matrix.project == 'engine'
