@@ -1,0 +1,6 @@
+# Scheduled journal, holdings risk and the reviewed cash-session calendar.
+numpy>=1.26,<3
+pandas>=2.1,<3
+requests>=2.31
+PyGithub>=2.1
+exchange-calendars>=4.13,<5

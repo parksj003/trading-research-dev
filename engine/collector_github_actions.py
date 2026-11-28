@@ -526,7 +526,8 @@ def fetch_yf_history(symbol: str, range_str="1y", quiet: bool = False) -> tuple:
             ts = res.get("timestamp") or []
             meta = res.get("meta") or {}
             off = meta.get("gmtoffset") or 0
-            YF_META[symbol] = {k: meta.get(k) for k in ("regularMarketPrice", "regularMarketTime", "regularMarketVolume", "gmtoffset", "chartPreviousClose")}
+            YF_META[symbol] = {k: meta.get(k) for k in ("regularMarketPrice", "regularMarketTime", "regularMarketVolume", "gmtoffset", "chartPreviousClose",
+                "symbol", "currency", "exchangeName", "exchangeTimezoneName", "instrumentType")}
             quote = (res.get("indicators", {}).get("quote") or [{}])[0]
             closes, volumes = quote.get("close") or [], quote.get("volume") or []
             n = min(len(ts), len(closes))
@@ -697,7 +698,67 @@ def _signed(v: float, fmt: str, prefix: str = "", suffix: str = "") -> str:
     return f"{'-' if v < 0 else '+'}{prefix}{abs(v):{fmt}}{suffix}"
 
 
-def analyze_market_data(now: datetime = None, cutoff: str = None):
+class _JournalDailyCloses:
+    """One morning auto run, Yahoo chart/quote 1d/1y only. No disk or OHLC consumers."""
+
+    def __init__(self, now):
+        self.now = now
+        self.sessions = {}
+        self.series = {}
+
+    def remember(self, market, symbol, dates, closes, volumes):
+        meta = YF_META.get(symbol, {})
+        kr = market == "KR"
+        zone = "Asia/Seoul" if kr else "America/New_York"
+        if (meta.get("symbol") != symbol or meta.get("currency") != ("KRW" if kr else "USD")
+                or meta.get("exchangeTimezoneName") != zone or not meta.get("exchangeName")):
+            return
+        if symbol.startswith("^"):
+            if meta.get("instrumentType") != "INDEX":
+                return
+        else:
+            if kr:
+                venues = {"KSC"} if symbol.endswith(".KS") else {"KOE"}
+            else:
+                venues = {"NYQ", "NMS", "NGM", "NCM", "ASE", "PCX", "BTS"}
+            if str(meta.get("exchangeName")) not in venues or meta.get("instrumentType") not in ("EQUITY", "ETF"):
+                return
+        if len(dates) >= 240 and len(dates) == len(closes) == len(volumes):
+            bars = (tuple(dates), tuple(closes), tuple(volumes))
+            self.series[market, symbol] = (time.monotonic(), meta.get("regularMarketTime"), bars)
+
+    def get(self, market, symbol):
+        entry = self.series.get((market, symbol))
+        if not entry or time.monotonic() - entry[0] >= 300:
+            return None
+        _, market_time, bars = entry
+        dates, closes, volumes = bars
+        try:
+            # Check the calendar only when another consumer actually requests the series.
+            if market not in self.sessions:
+                from watchlist.session_calendar import get_calendar
+                cal = get_calendar(market)
+                zone = KST if market == "KR" else NY
+                today = pd.Timestamp(self.now.astimezone(zone).date())
+                last = cal.date_to_session(today, direction="previous")
+                if cal.session_close(last) + timedelta(minutes=5) > self.now:
+                    last = cal.previous_session(last)
+                # This cache is used only in the Korean morning, before the KR session closes.
+                sessions = cal.sessions_in_range(today - timedelta(days=370), last)
+                required = sessions[sessions >= today - timedelta(days=364)]
+                self.sessions[market] = (tuple(sessions.strftime("%Y-%m-%d")), len(required), cal.session_close(last).timestamp())
+            sessions, required, close_time = self.sessions[market]
+            if (close_time <= market_time <= self.now.timestamp() and len(dates) >= required and dates == sessions[-len(dates):]
+                    and all(math.isfinite(x) and x > 0 for x in closes)
+                    and all(math.isfinite(x) and x >= 0 for x in volumes)):
+                return bars
+        except Exception as exc:
+            logger.debug("Daily close reuse unavailable (%s)", type(exc).__name__)
+        self.series.pop((market, symbol), None)
+        return None
+
+
+def analyze_market_data(now: datetime = None, cutoff: str = None, daily=None):
     """(health_data, macro_data, missing, pending_us) 반환. pending_us = 장중이라 제외된 미국 지수.
     cutoff(YYYY-MM-DD) 지정 시 해당 일자 이전 봉만 사용 (과거 일자 시황 재작성용, 장중 봉 제거는 생략)."""
     now = now or datetime.now(KST)
@@ -710,6 +771,8 @@ def analyze_market_data(now: datetime = None, cutoff: str = None):
             dates, closes, volumes, dropped = [dates[i] for i in keep], [closes[i] for i in keep], [volumes[i] for i in keep], False
         else:
             dates, closes, volumes, dropped = _drop_open_bar(name, dates, closes, volumes, off, now)
+        if daily is not None and not cutoff and name in INDEX_NAMES:
+            daily.remember("US" if name in US_INDEX_NAMES else "KR", sym, dates, closes, volumes)
         patched = False
         if not cutoff and not dropped and name in INDEX_NAMES:
             dates, closes, volumes, patched = _patch_stale_bar(name, sym, dates, closes, volumes, now)
@@ -1304,7 +1367,7 @@ def save_ledger(repo, df, sha, message):
 # ==========================================
 # 4. 시황 / 차트 / 종목 일지
 # ==========================================
-def ensure_market_journal(repo, date_iso: str, now: datetime, force: bool = False) -> bool:
+def ensure_market_journal(repo, date_iso: str, now: datetime, force: bool = False, daily=None) -> bool:
     past = date_iso < now.strftime("%Y-%m-%d")  # 과거 일자: 해당 일자 이전 종가 기준으로 재구성
     path = f"{MARKET_DIR}/{date_iso}.md"
     if repo_file_exists(repo, path):
@@ -1313,7 +1376,7 @@ def ensure_market_journal(repo, date_iso: str, now: datetime, force: bool = Fals
     wd = WEEKDAYS_KO[datetime.strptime(date_iso, "%Y-%m-%d").weekday()]
     ensure_limits(repo)
     logger.info("야후 파이낸스 / Finviz 데이터 수집 중...")
-    health_data, macro_data, missing, pending_us = analyze_market_data(now, date_iso if past else None)
+    health_data, macro_data, missing, pending_us = analyze_market_data(now, date_iso if past else None, daily=daily)
     if pending_us and not force:
         # 겨울철(EST) 등 06:07 KST 에는 미국 정규장 마감 직후라 봉이 미확정 → 다음 실행에서 재시도
         logger.info("미국 지수 종가 미확정(%s) → 다음 실행에서 시황 작성", ", ".join(pending_us))
@@ -1409,7 +1472,7 @@ def ensure_market_journal(repo, date_iso: str, now: datetime, force: bool = Fals
         else:
             try:
                 fx = (macro_data.get("USD/KRW") or {}).get("raw")
-                hc = holdings_context(repo, now)
+                hc = holdings_context(repo, now, daily=daily)
                 h_rows, h_errs, recon = hc["rows"], hc["errs"], hc["recon"]
                 if h_errs:
                     add_warning("보유 종목 조회 실패: " + "; ".join(h_errs))
@@ -2470,14 +2533,25 @@ def _yf_symbols(market: str, code: str) -> list:
 _BENCH_CACHE = {}
 
 
-def _bench_series(name: str, now: datetime):
-    """벤치마크 지수 일봉 (dates, closes). 실행 1회 동안 캐시. 받지 못하면 None."""
+def _holding_closes(market, symbol, session_name, now, daily):
+    if daily is not None:
+        cached = daily.get(market, symbol)
+        if cached is not None:
+            return cached
+    dates, closes, volumes, off = fetch_yf_history(symbol, "1y", quiet=True)
+    time.sleep(0.2)
+    dates, closes, volumes, _ = _drop_open_bar(session_name, dates, closes, volumes, off, now)
+    if daily is not None:
+        daily.remember(market, symbol, dates, closes, volumes)
+    return dates, closes, volumes
+
+
+def _bench_series(name: str, now: datetime, daily=None):
+    """Return the same date-aligned journal benchmark for all holdings in this pass."""
     if name not in _BENCH_CACHE:
-        d, c, v, off = fetch_yf_history(YF_SYMBOLS[name], "1y", quiet=True)
-        time.sleep(0.2)
-        if d:
-            d, c, v, _ = _drop_open_bar(name, d, c, v, off, now)
-        _BENCH_CACHE[name] = (d, c) if len(c) >= 30 else None
+        market = "US" if name in US_INDEX_NAMES else "KR"
+        dates, closes, _ = _holding_closes(market, YF_SYMBOLS[name], name, now, daily)
+        _BENCH_CACHE[name] = (dates, closes) if len(closes) >= 30 else None
     return _BENCH_CACHE[name]
 
 
@@ -2502,14 +2576,11 @@ def rs_icon(rs):
     return {(True, True): "🟢", (True, False): "🟡", (False, True): "🟠", (False, False): "🔴"}[(rs[0] >= 0, rs[1] >= 0)]
 
 
-def fetch_stock_tech(market: str, code: str, now: datetime, since: str = None):
+def fetch_stock_tech(market: str, code: str, now: datetime, since: str = None, daily=None):
     """보유 종목의 추세 상태/분산일/RS. 야후에서 일봉을 받지 못하면 None."""
     used = None
     for sym in _yf_symbols(market, code):
-        dates, closes, vols, off = fetch_yf_history(sym, "1y", quiet=True)
-        time.sleep(0.2)
-        if dates:
-            dates, closes, vols, _ = _drop_open_bar("KOSPI" if market == "KR" else "S&P 500", dates, closes, vols, off, now)
+        dates, closes, vols = _holding_closes(market, sym, "KOSPI" if market == "KR" else "S&P 500", now, daily)
         if len(closes) >= 30:
             used = sym
             break
@@ -2521,7 +2592,7 @@ def fetch_stock_tech(market: str, code: str, now: datetime, since: str = None):
             bench_name = LIMITS["rs_benchmark_us"]
         else:
             bench_name = (("KOSDAQ" if used.endswith(".KQ") else "KOSPI") if LIMITS["rs_benchmark_kr"] == "auto" else LIMITS["rs_benchmark_kr"])
-        bench = _bench_series(bench_name, now)
+        bench = _bench_series(bench_name, now, daily)
         rs = [calc_rs(dates, closes, bench, n) for n in LIMITS["rs_periods"]]
     status, arr, vs50 = trend_status(closes)
     sigma = calc_sigma(closes)
@@ -2537,12 +2608,12 @@ def fetch_stock_tech(market: str, code: str, now: datetime, since: str = None):
             "as_of": dates[-1], "close": closes[-1], "source": "Yahoo daily"}
 
 
-def holdings_context(repo, now: datetime, with_links: bool = True, with_recon: bool = True) -> dict:
+def holdings_context(repo, now: datetime, with_links: bool = True, with_recon: bool = True, daily=None) -> dict:
     """보유 종목 + 원장/사이클 + 손절·목표 + 추세지표를 한 번에 모은다(시황 작성과 위험 알림이 같이 사용).
     반환: {rows, errs, ledger, levels, tech, links, recon}"""
     rows, errs = fetch_holdings()
     ctx = {"rows": rows, "errs": errs, "ledger": None, "levels": {}, "tech": {}, "links": {}, "recon": []}
-    since, cycles = {}, {}
+    since, cycles = {}, None
     try:
         ledger, _ = load_ledger(repo)
         ctx["ledger"] = ledger
@@ -2556,8 +2627,10 @@ def holdings_context(repo, now: datetime, with_links: bool = True, with_recon: b
         logger.warning("원장 로드 실패: %s", mask(e))
     ledger = ctx["ledger"]
     if rows and ledger is not None and not ledger.empty:
-        steps = [("levels", lambda: holdings_levels(repo, rows, ledger), True),
-                 ("links", lambda: holdings_journal_links(repo, rows, ledger), with_links),
+        # A fill sync or manual edit may have changed a journal since the morning view.
+        _FILES_CACHE.pop("files", None)
+        steps = [("levels", lambda: holdings_levels(repo, rows, ledger, cycles=cycles), True),
+                 ("links", lambda: holdings_journal_links(repo, rows, ledger, cycles=cycles), with_links),
                  ("recon", lambda: reconcile_holdings(ledger, rows, HOLDINGS_OK), with_recon and LIMITS["reconcile_enabled"] and not errs)]
         for name, fn, enabled in steps:  # 단계별로 격리: 하나가 실패해도 나머지는 계속
             if enabled:
@@ -2565,11 +2638,11 @@ def holdings_context(repo, now: datetime, with_links: bool = True, with_recon: b
                     ctx[name] = fn()
                 except Exception as e:
                     logger.warning("보유 종목 %s 생성 실패: %s", name, mask(e))
-    ctx["tech"] = enrich_holdings(rows, now, since) if rows else {}
+    ctx["tech"] = enrich_holdings(rows, now, since, daily=daily) if rows else {}
     return ctx
 
 
-def enrich_holdings(rows: list, now: datetime, since: dict = None) -> dict:
+def enrich_holdings(rows: list, now: datetime, since: dict = None, daily=None) -> dict:
     """{(시장, 코드): 추세/분산일/트레일링 정보}. since: {(시장, 코드): 진입일} (샹들리에 기준). holdings_tech=false 면 생략."""
     if not LIMITS["holdings_tech"]:
         return {}
@@ -2577,7 +2650,7 @@ def enrich_holdings(rows: list, now: datetime, since: dict = None) -> dict:
     _BENCH_CACHE.clear()
     for key in dict.fromkeys((r["market"], r["code"]) for r in rows):
         try:
-            out[key] = fetch_stock_tech(key[0], key[1], now, (since or {}).get(key))
+            out[key] = fetch_stock_tech(key[0], key[1], now, (since or {}).get(key), daily=daily)
         except Exception as e:
             logger.warning("종목 지표 계산 실패 (%s): %s", key[1], mask(e))
             out[key] = None
@@ -2647,11 +2720,13 @@ def levels_for_cycle(repo, cycle: dict, code: str) -> dict:
     return out
 
 
-def holdings_levels(repo, rows: list, ledger: pd.DataFrame) -> dict:
+def holdings_levels(repo, rows: list, ledger: pd.DataFrame, *, cycles=None) -> dict:
     """{(코드, 통화): {stop, target, src}} — 보유 종목의 진행 중 사이클 기준."""
     if ledger is None or ledger.empty:
         return {}
-    cycles, out = compute_cycles(ledger), {}
+    if cycles is None:
+        cycles = compute_cycles(ledger)
+    out = {}
     for key in dict.fromkeys((r["code"], r["currency"]) for r in rows):
         cl = cycles.get(key) or []
         if cl:
@@ -2763,14 +2838,16 @@ def _tech_parts(info):
     return tr, dist, rs_s
 
 
-def holdings_journal_links(repo, rows: list, ledger: pd.DataFrame = None) -> dict:
+def holdings_journal_links(repo, rows: list, ledger: pd.DataFrame = None, *, cycles=None) -> dict:
     """{(코드, 통화): [(구분, 날짜, 상대경로)]} — 보유 종목의 진행 중(없으면 마지막) 사이클 체결일 일지 중 실제 존재하는 파일."""
     if ledger is None:
         ledger, _ = load_ledger(repo)
     if ledger.empty:
         return {}
-    files = [it.name for it in repo.get_contents(STOCK_DIR) if getattr(it, "type", "file") == "file" and it.name.endswith(".md")]
-    cycles = compute_cycles(ledger)
+    if cycles is None:
+        _FILES_CACHE.pop("files", None)
+        cycles = compute_cycles(ledger)
+    files = [name for name, _, _ in _stock_files(repo)]
     out = {}
     for key in dict.fromkeys((r["code"], r["currency"]) for r in rows):
         cyc_list = cycles.get(key) or []
@@ -2823,12 +2900,12 @@ def _alert_once(key: str, text: str) -> bool:
 RISK_TITLE = {"breach": "🛑 손절가 이탈", "near": "⚠️ 손절 임박", "trail": "⛔ 트레일링 이탈"}
 
 
-def risk_check(repo, now: datetime, context=None):
+def risk_check(repo, now: datetime, context=None, daily=None):
     """보유 종목의 손절 임박·이탈, 트레일링 이탈, 히트 초과를 텔레그램으로 알린다(같은 상태는 한 번). 실시간이 아니라 매시 실행 기준이며,
     실제 손절은 증권사 조건(스탑) 주문으로 거는 것을 전제로 한 보조 알림이다."""
     if not LIMITS["risk_alerts"] or not (NH_APP_KEY and NH_APP_SECRET and ACCOUNTS):
         return
-    hc = context if context is not None else holdings_context(repo, now, with_links=False, with_recon=False)
+    hc = context if context is not None else holdings_context(repo, now, with_links=False, with_recon=False, daily=daily)
     if hc["errs"] or not hc["rows"]:
         return
     items = aggregate_holdings(hc["rows"])
@@ -3970,9 +4047,11 @@ def run(args) -> int:
             d_iso = iso_date(_digits(args.date)) if args.date else now.strftime("%Y-%m-%d")
             ensure_market_journal(get_data_repo(), d_iso, now, force=True)
         elif args.mode in ("hourly_check", "auto"):
+            daily = None
             if args.mode == "auto" and now.weekday() < 5 and 6 <= now.hour <= 10:
                 try:
-                    ensure_market_journal(get_data_repo(), now.strftime("%Y-%m-%d"), now)
+                    daily = _JournalDailyCloses(now)
+                    ensure_market_journal(get_data_repo(), now.strftime("%Y-%m-%d"), now, daily=daily)
                 except Exception as e:  # 시황 실패가 체결 동기화를 막지 않도록 분리
                     logger.exception(e)
                     add_warning(f"시황 작성 오류: {type(e).__name__}")
@@ -3987,7 +4066,7 @@ def run(args) -> int:
             try:  # 손절·트레일링 알림은 부가 기능: 실패해도 동기화 결과에 영향 없음
                 if portfolio_enabled():
                     portfolio_context = holdings_context(get_data_repo(), now, with_links=False)
-                risk_check(get_data_repo(), now, context=portfolio_context)
+                risk_check(get_data_repo(), now, context=portfolio_context, daily=daily if daily and daily.series else None)
             except Exception as e:
                 logger.warning("위험 알림 확인 실패: %s", mask(e))
     except Exception as e:
