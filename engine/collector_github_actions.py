@@ -2537,6 +2537,7 @@ def _holding_closes(market, symbol, session_name, now, daily):
     if daily is not None:
         cached = daily.get(market, symbol)
         if cached is not None:
+            logger.info("일지 확정 일봉 재사용")
             return cached
     dates, closes, volumes, off = fetch_yf_history(symbol, "1y", quiet=True)
     time.sleep(0.2)
