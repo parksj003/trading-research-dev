@@ -73,12 +73,16 @@ def test_ineligible_series_refetched(monkeypatch, bad):
         doc["meta"][{"currency": "currency", "identity": "symbol", "venue": "exchangeName", "zone": "exchangeTimezoneName"}[bad]] = "unknown"
     docs = {SYMBOL: doc}
     calls = serve(monkeypatch, docs)
+    log = Mock()
+    monkeypatch.setattr(journal.logger, "info", log)
     daily = journal._JournalDailyCloses(NOW)
     read = lambda: journal._holding_closes("US", SYMBOL, "S&P 500", NOW, daily)
     read()
     docs[SYMBOL] = response(SYMBOL)
     good = read()
+    log.assert_not_called()
     assert tuple(map(tuple, good)) == read()
+    log.assert_called_once_with("일지 확정 일봉 재사용")
     assert calls[SYMBOL] == 2
 
 
